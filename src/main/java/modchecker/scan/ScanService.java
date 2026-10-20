@@ -12,7 +12,7 @@ import java.util.Locale;
 /**
  * Проверка одного мода: читаем содержимое, ищем строки по правилам 1-8,
  * маскировку и энтропию (9, 18, 19; правило 18 - только в .class),
- * байткод (10-16), имена классов (20, 21) и исполняемые файлы (17).
+ * байткод (10-16, 22-23), имена классов (20, 21) и исполняемые файлы (17).
  */
 public final class ScanService {
 
@@ -39,6 +39,7 @@ public final class ScanService {
         StringObfuscationScanner obfuscation = new StringObfuscationScanner(result);
         ExternalPathScanner externalPaths = new ExternalPathScanner(result);
         LargeFileScanner largeFiles = new LargeFileScanner(result);
+        HardwareIdScanner hardwareIds = new HardwareIdScanner(result);
         String executableLocation = null;
         String executableName = null;
         BytecodeScanState bytecodeState = new BytecodeScanState();
@@ -48,11 +49,11 @@ public final class ScanService {
 
             if (lowerName.endsWith(".class")) {
                 scanClass(file, result, textRules, obfuscation, externalPaths,
-                        bytecodeState);
+                        hardwareIds, bytecodeState);
             } else if (isTextFile(lowerName)) {
                 String content = new String(file.data(), StandardCharsets.UTF_8);
                 String location = "файл " + file.location();
-                textRules.inspect(content, location);
+                textRules.inspectText(content, location);
                 obfuscation.inspectText(content, location);
                 externalPaths.inspect(content, location);
             }
@@ -85,7 +86,9 @@ public final class ScanService {
             ));
         }
 
-        ClassNameScanner.inspect(files, result);
+        List<String> classNames = ClassNameScanner.simpleNames(files);
+        hardwareIds.finish(classNames);
+        ClassNameScanner.inspectNames(classNames, result);
         LinkService.apply(result);
 
         return result;
@@ -95,15 +98,18 @@ public final class ScanService {
                            TextRuleScanner textRules,
                            StringObfuscationScanner obfuscation,
                            ExternalPathScanner externalPaths,
+                           HardwareIdScanner hardwareIds,
                            BytecodeScanState bytecodeState) {
         try {
             for (StringConstant constant : ClassStringExtractor.extract(file.data())) {
                 String location = "класс " + constant.className()
                         + ", метод " + constant.methodName()
                         + " - " + file.location();
-                textRules.inspect(constant.value(), location);
+                textRules.inspectClassConstant(constant.value(), location);
                 obfuscation.inspectClassConstant(constant.value(), location);
                 externalPaths.inspect(constant.value(), location);
+                hardwareIds.inspectClassConstant(
+                        constant.value(), constant.className(), location);
             }
         } catch (RuntimeException ignored) {
             // Повреждённый .class пропускаем, но остальные файлы мода проверяем.
@@ -125,6 +131,10 @@ public final class ScanService {
             bytecodeState.dangerousXorFound = true;
         }
 
+        for (HardwareCall call : analysis.hardwareCalls()) {
+            hardwareIds.inspectCall(call, file.location());
+        }
+
         addDangerousCalls(analysis, file, result);
         addDecodedStrings(analysis.xorStrings(), analysis, file, result);
         addDecodedStrings(analysis.assembledStrings(), analysis, file, result);
@@ -133,19 +143,23 @@ public final class ScanService {
     private void addDangerousCalls(BytecodeAnalysis analysis, ArchiveFile file,
                                    ModScanResult result) {
         for (DangerousCall call : analysis.dangerousCalls()) {
-            if (result.hasRule(call.rule())) {
-                continue;
+            boolean opensFolderOrLink = call.rule() == 13
+                    && call.openCommandContext();
+            int points = opensFolderOrLink ? 1 : callPoints(call.rule());
+            String evidence = "вызов: " + call.owner().replace('/', '.')
+                    + "." + call.calledName();
+            if (opensFolderOrLink) {
+                evidence += " (рядом: открытие папки/ссылки)";
             }
 
-            result.addFinding(new Finding(
+            result.addOrUpgradeFinding(new Finding(
                     call.rule(),
                     callTitle(call.rule()),
-                    callPoints(call.rule()),
+                    points,
                     "класс " + call.className()
                             + ", метод " + call.methodName()
                             + " - " + file.location(),
-                    "вызов: " + call.owner().replace('/', '.')
-                            + "." + call.calledName()
+                    evidence
             ));
         }
 
@@ -177,7 +191,9 @@ public final class ScanService {
                                    ModScanResult result) {
         for (DecodedCandidate candidate : candidates) {
             for (SignatureRule baseRule : SignatureRules.matching(candidate.value())) {
-                result.markEvidenceRule(baseRule.id());
+                result.markEvidenceRule(baseRule.id(), "класс " + analysis.className()
+                        + ", метод " + candidate.methodName()
+                        + " - " + file.location());
                 result.addOrUpgradeFinding(new Finding(
                         10,
                         "Строка восстановлена из байткода",

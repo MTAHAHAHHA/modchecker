@@ -7,14 +7,13 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
-import java.util.Locale;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 
 /**
- * Читает jar как обычный архив. Вложенные jar тоже читаются как данные,
- * максимум на два уровня вглубь. Никакие классы здесь не загружаются.
+ * Читает jar как обычный архив. Вложенные jar и .jar.sample тоже читаются
+ * как данные, максимум на два уровня вглубь. Никакие классы здесь не загружаются.
  */
 final class JarWalker {
 
@@ -81,7 +80,7 @@ final class JarWalker {
     }
 
     private static boolean isJar(String entryName) {
-        return entryName.toLowerCase(Locale.ROOT).endsWith(".jar");
+        return ModFinder.isModFileName(entryName);
     }
 
     private static boolean looksLikeZip(byte[] data) {

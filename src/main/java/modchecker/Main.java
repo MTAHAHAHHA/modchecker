@@ -20,8 +20,9 @@ import java.util.List;
  * Точка входа программы ModChecker.
  *
  * Без аргументов открывает окно. С одним аргументом работает старый
- * консольный режим: сканирует jar-файлы, считает очки, проверяет SHA-1
- * на Modrinth и отпечаток CurseForge, затем печатает отчёт.
+ * консольный режим: сканирует jar-файлы и образцы .jar.sample, считает
+ * очки, проверяет SHA-1 на Modrinth и отпечаток CurseForge, затем печатает
+ * отчёт.
  */
 public final class Main {
 
@@ -35,7 +36,8 @@ public final class Main {
         }
 
         if (args.length != 1) {
-            System.out.println("Использование: java -jar modchecker.jar [папка mods или один .jar]");
+            System.out.println("Использование: java -jar modchecker.jar "
+                    + "[папка mods, один .jar или .jar.sample]");
             System.out.println("Без аргументов открывается графическое окно.");
             return;
         }
@@ -66,7 +68,7 @@ public final class Main {
         System.out.println("Найдено модов: " + mods.size());
 
         if (mods.isEmpty()) {
-            System.out.println("Jar-файлы не найдены.");
+            System.out.println("Jar-файлы (.jar, .jar.sample) не найдены.");
             ReportPrinter.print(List.of(), System.out);
             return;
         }
@@ -78,7 +80,8 @@ public final class Main {
     private static void launchGui() {
         if (GraphicsEnvironment.isHeadless()) {
             System.out.println("ОШИБКА: графический режим недоступен (headless).");
-            System.out.println("Запустите с путём: java -jar modchecker.jar <папка mods или один .jar>");
+            System.out.println("Запустите с путём: java -jar modchecker.jar "
+                    + "<папка mods, один .jar или .jar.sample>");
             return;
         }
 

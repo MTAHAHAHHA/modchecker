@@ -15,7 +15,7 @@ final class ClassNameScanner {
     private ClassNameScanner() {
     }
 
-    static void inspect(List<ArchiveFile> files, ModScanResult result) {
+    static List<String> simpleNames(List<ArchiveFile> files) {
         List<String> names = new ArrayList<>();
 
         for (ArchiveFile file : files) {
@@ -31,6 +31,10 @@ final class ClassNameScanner {
             names.add(simpleName);
         }
 
+        return names;
+    }
+
+    static void inspectNames(List<String> names, ModScanResult result) {
         if (names.isEmpty()) {
             return;
         }
