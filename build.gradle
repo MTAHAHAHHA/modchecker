@@ -1,0 +1,112 @@
+plugins {
+    id 'java'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group = 'modchecker'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.ow2.asm:asm:9.11.1'
+    implementation 'com.google.code.gson:gson:2.14.0'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}
+
+tasks.register('copyReadme', Copy) {
+    description = 'Копирует README.txt рядом с modchecker.jar.'
+    from layout.projectDirectory.file('README.txt')
+    into layout.buildDirectory.dir('libs')
+}
+
+tasks.named('shadowJar') {
+    archiveFileName = 'modchecker.jar'
+    manifest {
+        attributes 'Main-Class': 'modchecker.Main'
+    }
+    finalizedBy tasks.named('copyReadme')
+}
+
+tasks.named('build') {
+    dependsOn tasks.named('shadowJar')
+    dependsOn tasks.named('copyReadme')
+}
+
+sourceSets {
+    selftest {
+        java.srcDir 'src/selftest/java'
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+configurations {
+    selftestImplementation.extendsFrom implementation
+    selftestRuntimeOnly.extendsFrom runtimeOnly
+}
+
+def testModsDir = layout.buildDirectory.dir('testmods')
+def testModsExtraDir = layout.buildDirectory.dir('testmods-extra')
+def testModsWorkDir = layout.buildDirectory.dir('testmods-work')
+
+tasks.register('buildTestMods', JavaExec) {
+    group = 'verification'
+    description = 'Собирает безопасные тестовые моды (без запуска их кода).'
+
+    dependsOn tasks.named('selftestClasses')
+
+    classpath = sourceSets.selftest.runtimeClasspath
+    mainClass = 'modchecker.selftest.TestModsBuilder'
+
+    def output = testModsDir.get().asFile
+    def extraOutput = testModsExtraDir.get().asFile
+    def work = testModsWorkDir.get().asFile
+    args output.absolutePath, work.absolutePath, extraOutput.absolutePath
+
+    inputs.files(sourceSets.selftest.output).withPropertyName('selftestClasses')
+    outputs.dir(output)
+    outputs.dir(extraOutput)
+}
+
+tasks.register('selfTest', JavaExec) {
+    group = 'verification'
+    description = 'Проверяет тестовые моды и (на следующих шагах) работу сканера.'
+
+    dependsOn tasks.named('buildTestMods')
+
+    classpath = sourceSets.selftest.runtimeClasspath
+    mainClass = 'modchecker.selftest.SelfTest'
+    args testModsDir.get().asFile.absolutePath,
+            testModsExtraDir.get().asFile.absolutePath
+}
+
+tasks.register('guiSmoke', JavaExec) {
+    group = 'verification'
+    description = 'Открывает GUI на build/testmods и печатает получившуюся таблицу.'
+
+    dependsOn tasks.named('buildTestMods')
+
+    classpath = sourceSets.selftest.runtimeClasspath
+    mainClass = 'modchecker.selftest.GuiSmoke'
+    args testModsDir.get().asFile.absolutePath
+    systemProperty 'java.awt.headless', 'false'
+    jvmArgs '-Dfile.encoding=UTF-8',
+            '-Dstdout.encoding=UTF-8',
+            '-Dstderr.encoding=UTF-8'
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('selfTest')
+}

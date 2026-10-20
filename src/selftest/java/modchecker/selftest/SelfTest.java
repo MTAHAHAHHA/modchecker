@@ -1,0 +1,1430 @@
+package modchecker.selftest;
+
+import modchecker.gui.ModTableModel;
+import modchecker.model.Finding;
+import modchecker.model.LinkFinding;
+import modchecker.model.ModScanResult;
+import modchecker.model.Verdict;
+import modchecker.online.CurseForgeKeyStore;
+import modchecker.online.Hashes;
+import modchecker.online.KeyCheckStatus;
+import modchecker.online.OnlineCheckResult;
+import modchecker.online.OnlineChecker;
+import modchecker.online.OnlineStatus;
+import modchecker.report.ModReport;
+import modchecker.report.ReportPrinter;
+import modchecker.scan.ModFinder;
+import modchecker.scan.ScanService;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipOutputStream;
+import java.util.stream.Stream;
+
+/**
+ * Первый набор автотестов. На этом шаге он проверяет, что тестовые jar'ы
+ * действительно содержат нужные строки и байткод, но ничего не запускает.
+ */
+public final class SelfTest {
+
+    private static final List<String> EXPECTED_JARS = List.of(
+            "broken.jar",
+            "clean.jar",
+            "discord_integration.jar",
+            "fractureiser.jar",
+            "hidden_stealer.jar",
+            "loader.jar",
+            "obfuscated.jar",
+            "stealer.jar",
+            "xor_stealer.jar"
+    );
+
+    private static final List<String> EXPECTED_EXTRA_JARS = List.of(
+            "asm_calls.jar",
+            "clinit_exec.jar",
+            "hidden_max_10.jar",
+            "hidden_max_9.jar",
+            "paths.jar",
+            "safe_xor.jar",
+            "symbol_assembly.jar",
+            "symbol_chars.jar"
+    );
+
+    private static final String DISCORD_WEBHOOK =
+            "https://discord.com/api/webhooks/123456789012345678/test-token";
+    private static final String HIDDEN_WEBHOOK =
+            "https://discord.com/api/webhooks/1/test";
+
+    private static final List<String> CLEAN_FORBIDDEN = List.of(
+            "discord.com/api/webhooks",
+            "discordapp.com/api/webhooks",
+            "api.telegram.org",
+            "launcher_accounts",
+            "launcher_profiles",
+            "Local Storage",
+            "leveldb",
+            "Login Data",
+            "Cookies",
+            "wallet.dat",
+            "dev/neko",
+            "skyrage",
+            "pastebin.com",
+            "URLClassLoader",
+            "defineClass",
+            "Runtime",
+            "ProcessBuilder",
+            "openConnection",
+            "HttpClient",
+            "APPDATA",
+            "AppData",
+            "user.home"
+    );
+
+    private static int passed;
+    private static int failed;
+
+    private SelfTest() {
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length != 2) {
+            throw new IllegalArgumentException(
+                    "Нужны пути к папке тестовых модов и папке дополнительных модов");
+        }
+
+        Path modsDir = Path.of(args[0]).toAbsolutePath().normalize();
+        Path extraDir = Path.of(args[1]).toAbsolutePath().normalize();
+        System.out.println("Проверяю тестовые моды в " + modsDir);
+        System.out.println("Дополнительные моды: " + extraDir);
+        System.out.println();
+
+        check("Созданы все 9 тестовых файлов", () -> {
+            List<String> actual = listJarNames(modsDir);
+            if (!actual.equals(EXPECTED_JARS)) {
+                throw new IllegalStateException("ожидалось " + EXPECTED_JARS + ", получено " + actual);
+            }
+        });
+
+        check("Созданы все 8 дополнительных тестовых файлов", () -> {
+            List<String> actual = listJarNames(extraDir);
+            if (!actual.equals(EXPECTED_EXTRA_JARS)) {
+                throw new IllegalStateException(
+                        "ожидалось " + EXPECTED_EXTRA_JARS + ", получено " + actual);
+            }
+        });
+
+        check("clean: обычные строки без опасных признаков", () -> verifyClean(modsDir));
+        check("discord_integration: вебхук и HttpClient", () -> verifyDiscord(modsDir));
+        check("stealer: вебхук и Local Storage", () -> verifyStealer(modsDir));
+        check("hidden_stealer: вебхук только в Base64", () -> verifyHidden(modsDir));
+        check("xor_stealer: Telegram XOR и launcher_accounts", () -> verifyXor(modsDir));
+        check("loader: pastebin XOR, URLClassLoader в <clinit>", () -> verifyLoader(modsDir));
+        check("fractureiser: строка dev/neko", () -> verifyFractureiser(modsDir));
+        check("obfuscated: 12 классов и длинная случайная строка", () -> verifyObfuscated(modsDir));
+        check("broken: файл не открывается как zip", () -> verifyBroken(modsDir));
+
+        runScannerChecks(modsDir, extraDir, modsDir.resolveSibling("selftest-tmp"));
+
+        System.out.println();
+        if (failed > 0) {
+            throw new IllegalStateException("Провалено проверок: " + failed + ", пройдено: " + passed);
+        }
+        System.out.println("Итог: " + passed + " проверок пройдено, 0 провалено.");
+    }
+
+    private static void verifyClean(Path modsDir) throws IOException {
+        Map<String, byte[]> entries = readEntries(modsDir.resolve("clean.jar"));
+
+        require(entries.containsKey("testmods/clean/CleanMod.class"),
+                "в clean.jar нет CleanMod.class");
+        require(containsInAnyEntry(entries, "Hello, Minecraft!"),
+                "в clean.jar нет ожидаемой безопасной строки");
+
+        for (String forbidden : CLEAN_FORBIDDEN) {
+            require(!containsInAnyEntry(entries, forbidden),
+                    "clean.jar случайно содержит опасный признак: " + forbidden);
+        }
+    }
+
+    private static void verifyDiscord(Path modsDir) throws IOException {
+        Map<String, byte[]> entries = readEntries(modsDir.resolve("discord_integration.jar"));
+
+        require(containsInAnyEntry(entries, DISCORD_WEBHOOK),
+                "не найден Discord-вебхук");
+        require(containsInAnyEntry(entries, "java/net/http/HttpClient"),
+                "не найден вызов HttpClient");
+    }
+
+    private static void verifyStealer(Path modsDir) throws IOException {
+        Map<String, byte[]> entries = readEntries(modsDir.resolve("stealer.jar"));
+
+        require(containsInAnyEntry(entries, DISCORD_WEBHOOK), "не найден Discord-вебхук");
+        require(containsInAnyEntry(entries, "Local Storage"), "не найдена строка Local Storage");
+    }
+
+    private static void verifyHidden(Path modsDir) throws IOException {
+        Map<String, byte[]> entries = readEntries(modsDir.resolve("hidden_stealer.jar"));
+
+        require(!containsInAnyEntry(entries, HIDDEN_WEBHOOK),
+                "вебхук присутствует открытым текстом, а должен быть только в Base64");
+        require(containsInAnyEntry(entries, "Local Storage"), "не найдена строка Local Storage");
+
+        boolean decoded = false;
+        for (byte[] classBytes : classEntries(entries).values()) {
+            for (String constant : stringConstants(classBytes)) {
+                try {
+                    String plain = new String(Base64.getDecoder().decode(constant),
+                            StandardCharsets.UTF_8);
+                    if (plain.contains(HIDDEN_WEBHOOK)) {
+                        decoded = true;
+                        break;
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // Это просто не Base64-строка.
+                }
+            }
+            if (decoded) {
+                break;
+            }
+        }
+        require(decoded, "Base64-строка не раскодируется в ожидаемый вебхук");
+    }
+
+    private static void verifyXor(Path modsDir) throws IOException {
+        Map<String, byte[]> entries = readEntries(modsDir.resolve("xor_stealer.jar"));
+
+        require(!containsInAnyEntry(entries, "api.telegram.org"),
+                "api.telegram.org присутствует открытым текстом, а должен быть XOR");
+        require(containsInAnyEntry(entries, "launcher_accounts"),
+                "не найдена строка launcher_accounts");
+        require(hasOpcode(entries, Opcodes.IXOR),
+                "в байткоде xor_stealer нет операции XOR");
+    }
+
+    private static void verifyLoader(Path modsDir) throws IOException {
+        Map<String, byte[]> entries = readEntries(modsDir.resolve("loader.jar"));
+
+        require(!containsInAnyEntry(entries, "pastebin.com"),
+                "pastebin.com присутствует открытым текстом, а должен быть XOR");
+
+        boolean found = classEntries(entries).values().stream()
+                .anyMatch(SelfTest::hasUrlClassLoaderInStaticInitializer);
+        require(found, "не найден URLClassLoader внутри <clinit>");
+    }
+
+    private static void verifyFractureiser(Path modsDir) throws IOException {
+        Map<String, byte[]> entries = readEntries(modsDir.resolve("fractureiser.jar"));
+        require(containsInAnyEntry(entries, "dev/neko"), "не найдена строка dev/neko");
+    }
+
+    private static void verifyObfuscated(Path modsDir) throws IOException {
+        Map<String, byte[]> entries = readEntries(modsDir.resolve("obfuscated.jar"));
+
+        Set<String> names = new LinkedHashSet<>();
+        for (String name : entries.keySet()) {
+            if (name.startsWith("testmods/obfuscated/") && name.endsWith(".class")) {
+                String simpleName = name.substring("testmods/obfuscated/".length(),
+                        name.length() - ".class".length());
+                names.add(simpleName);
+            }
+        }
+
+        Set<String> expected = new LinkedHashSet<>(Arrays.asList(
+                "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"));
+        require(names.equals(expected), "ожидались классы a..l, найдено: " + names);
+
+        List<String> constants = new ArrayList<>();
+        for (byte[] classBytes : classEntries(entries).values()) {
+            constants.addAll(stringConstants(classBytes));
+        }
+
+        boolean hasLongRandom = constants.stream().anyMatch(value ->
+                value.length() >= 64
+                        && value.chars().noneMatch(Character::isWhitespace)
+                        && !value.contains("/")
+                        && !value.contains(";")
+                        && entropy(value) >= 4.8);
+
+        require(hasLongRandom, "не найдена длинная случайная строка с энтропией >= 4.8");
+    }
+
+    private static void verifyBroken(Path modsDir) {
+        boolean openedAsZip = false;
+        try {
+            readEntries(modsDir.resolve("broken.jar"));
+            openedAsZip = true;
+        } catch (IOException expected) {
+            // Так и должно быть: это не zip.
+        }
+        require(!openedAsZip, "broken.jar неожиданно открылся как zip");
+    }
+
+    private static void runScannerChecks(Path modsDir, Path extraDir,
+                                         Path tempDir) throws IOException {
+        Files.createDirectories(tempDir);
+        ScanService scanner = new ScanService();
+
+        check("Хеши: MurmurHash2 и фильтрация CurseForge", () -> {
+            require(Hashes.murmurHash2(utf8(""), 1) == 1540447798L,
+                    "MurmurHash2 для пустой строки");
+            require(Hashes.murmurHash2(utf8("a"), 1) == 626045324L,
+                    "MurmurHash2 для \"a\"");
+            require(Hashes.murmurHash2(utf8("hello"), 1) == 2788266382L,
+                    "MurmurHash2 для \"hello\"");
+            require(Hashes.murmurHash2(utf8("Minecraft mod"), 1) == 2127713455L,
+                    "MurmurHash2 для \"Minecraft mod\"");
+            require(Hashes.curseForgeFingerprint(utf8("Minecraft mod")) == 101310214L,
+                    "фильтрованный отпечаток CurseForge");
+            require(Arrays.equals(
+                            Hashes.filterForCurseForge(utf8("a\tb\nc\rd e")),
+                            utf8("abcde")),
+                    "фильтр CurseForge должен убирать 9, 10, 13 и 32");
+        });
+
+        check("Хеши: SHA-1 файла", () -> {
+            Path file = tempDir.resolve("sha1_hello.txt");
+            Files.writeString(file, "hello", StandardCharsets.UTF_8);
+            require(Hashes.sha1(file).equals(
+                            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+                    "неверный SHA-1 для строки hello");
+        });
+
+        check("Сканер: clean - 0 очков", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("clean.jar"));
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        check("Сканер: discord_integration - вебхук и HttpClient", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("discord_integration.jar"));
+            assertPointsAndRules(result, 6, Set.of(1, 14));
+            require(finding(result, 1).location().contains("DiscordIntegration"),
+                    "в месте находки нет класса DiscordIntegration");
+            require(finding(result, 1).location().contains("webhook"),
+                    "в месте находки нет метода webhook");
+            require(finding(result, 14).location().contains("client"),
+                    "у HttpClient не показан метод client");
+            require(finding(result, 14).evidence().contains("HttpClient"),
+                    "в доказательстве нет HttpClient");
+        });
+
+        check("Сканер: stealer - вебхук, Local Storage и КРАЖА", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("stealer.jar"));
+            assertPointsRulesAndLinks(result, 12, Set.of(1, 4), Set.of("КРАЖА"));
+            LinkFinding theft = link(result, "КРАЖА");
+            require(theft.points() == 4, "связка КРАЖА должна давать +4");
+            require(theft.evidence().contains("1") && theft.evidence().contains("4"),
+                    "в связке КРАЖА не указаны правила 1 и 4");
+        });
+
+        check("Сканер: hidden_stealer - Base64-вебхук, Local Storage и КРАЖА", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("hidden_stealer.jar"));
+            assertPointsRulesAndLinks(result, 15, Set.of(4, 9), Set.of("КРАЖА"));
+            require(result.hasEvidenceRule(1),
+                    "скрытый вебхук должен участвовать в связке КРАЖА");
+            require(finding(result, 9).points() == 7,
+                    "за скрытый вебхук ожидалось 4 + 3 = 7 очков");
+            require(finding(result, 9).location().contains("packed"),
+                    "в месте находки нет метода packed");
+            require(link(result, "КРАЖА").evidence().contains("1 + 4"),
+                    "связка должна сложиться из скрытого правила 1 и правила 4");
+        });
+
+        check("Сканер: xor_stealer - Telegram XOR, аккаунты и КРАЖА", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("xor_stealer.jar"));
+            assertPointsRulesAndLinks(result, 13, Set.of(3, 10), Set.of("КРАЖА"));
+            require(finding(result, 3).location().contains("accounts"),
+                    "в месте находки нет метода accounts");
+            require(finding(result, 10).points() == 6,
+                    "за XOR-строку Telegram ожидалось 3 + 3 = 6 очков");
+            require(finding(result, 10).location().contains("endpoint"),
+                    "у XOR-строки не показан метод endpoint");
+            require(finding(result, 10).evidence().contains("XOR"),
+                    "не указано, что строка восстановлена XOR");
+            require(result.hasEvidenceRule(2),
+                    "XOR-строка api.telegram.org должна считаться Telegram");
+            require(!result.hasRule(11),
+                    "правило 11 не должно добавляться, если XOR дал опасную строку");
+            require(link(result, "КРАЖА").evidence().contains("2 + 3"),
+                    "связка должна сложиться из XOR-правила 2 и правила 3");
+        });
+
+        check("Сканер: loader - pastebin XOR, URLClassLoader и ЗАГРУЗЧИК", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("loader.jar"));
+            assertPointsRulesAndLinks(result, 13, Set.of(10, 12, 16), Set.of("ЗАГРУЗЧИК"));
+            require(finding(result, 10).points() == 4,
+                    "за XOR-строку pastebin ожидалось 1 + 3 = 4 очка");
+            require(finding(result, 10).location().contains("<clinit>"),
+                    "у XOR-строки не показан метод <clinit>");
+            require(result.hasEvidenceRule(8),
+                    "XOR-строка pastebin должна считаться Pastebin");
+            require(finding(result, 12).location().contains("<clinit>"),
+                    "URLClassLoader должен быть найден в <clinit>");
+            require(finding(result, 16).location().contains("<clinit>"),
+                    "правило 16 должно указать <clinit>");
+            require(!result.hasRule(11),
+                    "правило 11 не должно добавляться, если XOR дал опасную строку");
+            LinkFinding loaderLink = link(result, "ЗАГРУЗЧИК");
+            require(loaderLink.points() == 3, "связка ЗАГРУЗЧИК должна давать +3");
+            require(loaderLink.evidence().contains("10 + 12"),
+                    "связка должна сложиться из правил 10 и 12");
+        });
+
+        check("Сканер: случайная строка + defineClass не даёт ЗАГРУЗЧИК", () -> {
+            String token = randomToken(80, 777L);
+            Path jar = writeJar(tempDir, "random_string_define_class.jar", Map.of(
+                    "testmods/define/DefineRandom.class",
+                    classWithStringAndDefineClass(
+                            "testmods/define/DefineRandom", token)
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsRulesAndLinks(result, 5, Set.of(12, 18), Set.of());
+            require(result.hasRule(12), "defineClass должен дать правило 12");
+            require(result.hasRule(18), "случайная строка должна дать правило 18");
+            require(result.links().isEmpty(),
+                    "правило 18 не должно участвовать в связке ЗАГРУЗЧИК");
+        });
+
+        check("Сканер: правило 9 берёт максимум из pastebin и вебхука", () -> {
+            ModScanResult result = scanner.scan(extraDir.resolve("hidden_max_9.jar"));
+            assertPointsAndRules(result, 7, Set.of(9));
+            require(finding(result, 9).points() == 7,
+                    "из 4 и 7 очков должно остаться максимальное значение 7");
+            require(finding(result, 9).evidence().contains("Discord"),
+                    "победить должен скрытый Discord-вебхук");
+            require(result.hasEvidenceRule(1) && result.hasEvidenceRule(8),
+                    "обе скрытые строки должны остаться в доказательствах");
+        });
+
+        check("Сканер: правило 10 берёт максимум из двух XOR-строк", () -> {
+            ModScanResult result = scanner.scan(extraDir.resolve("hidden_max_10.jar"));
+            assertPointsAndRules(result, 7, Set.of(10));
+            require(finding(result, 10).points() == 7,
+                    "из 4 и 7 очков должно остаться максимальное значение 7");
+            require(finding(result, 10).location().contains("webhook"),
+                    "победить должна XOR-строка из метода webhook");
+            require(finding(result, 10).evidence().contains("Discord"),
+                    "победить должен скрытый Discord-вебхук");
+            require(result.hasEvidenceRule(1) && result.hasEvidenceRule(8),
+                    "обе XOR-строки должны остаться в доказательствах");
+        });
+
+        check("Сканер: Runtime.exec/ProcessBuilder и сетевые вызовы", () -> {
+            ModScanResult result = scanner.scan(extraDir.resolve("asm_calls.jar"));
+            assertPointsAndRules(result, 5, Set.of(13, 14));
+            require(finding(result, 13).location().contains("exec"),
+                    "у правила 13 не показан метод exec");
+            require(finding(result, 14).location().contains("connect"),
+                    "у правила 14 не показан метод connect");
+            require(!result.hasRule(16),
+                    "вне <clinit> правило 16 добавляться не должно");
+        });
+
+        check("Сканер: два опасных вызова в <clinit> дают 16 один раз", () -> {
+            ModScanResult result = scanner.scan(extraDir.resolve("clinit_exec.jar"));
+            assertPointsAndRules(result, 5, Set.of(13, 16));
+            require(finding(result, 16).location().contains("<clinit>"),
+                    "правило 16 должно указать <clinit>");
+            require(result.findings().stream()
+                            .filter(finding -> finding.rule() == 16).count() == 1,
+                    "правило 16 должно добавляться только один раз");
+        });
+
+        check("Сканер: APPDATA и user.home - правило 15", () -> {
+            ModScanResult result = scanner.scan(extraDir.resolve("paths.jar"));
+            assertPointsAndRules(result, 2, Set.of(15));
+            require(finding(result, 15).location().contains("PathsMod"),
+                    "у пути не показан класс PathsMod");
+            require(finding(result, 15).evidence().contains("APPDATA"),
+                    "не указан найденный путь APPDATA");
+        });
+
+        check("Сканер: безопасный XOR-цикл - правило 11", () -> {
+            ModScanResult result = scanner.scan(extraDir.resolve("safe_xor.jar"));
+            assertPointsAndRules(result, 2, Set.of(11));
+            require(finding(result, 11).location().contains("text"),
+                    "у XOR-цикла не показан метод text");
+            require(!result.hasRule(10),
+                    "безопасная XOR-строка не должна давать правило 10");
+        });
+
+        check("Сканер: сборка строки через StringBuilder", () -> {
+            ModScanResult result = scanner.scan(extraDir.resolve("symbol_assembly.jar"));
+            assertPointsAndRules(result, 6, Set.of(10));
+            require(finding(result, 10).location().contains("endpoint"),
+                    "у собранной строки не показан метод endpoint");
+            require(finding(result, 10).evidence().contains("сборка по символам"),
+                    "не указан способ сборки по символам");
+            require(result.hasEvidenceRule(2),
+                    "собранный api.telegram.org должен считаться Telegram");
+        });
+
+        check("Сканер: сборка строки из char[]", () -> {
+            ModScanResult result = scanner.scan(extraDir.resolve("symbol_chars.jar"));
+            assertPointsAndRules(result, 7, Set.of(10));
+            require(finding(result, 10).location().contains("webhook"),
+                    "у собранной строки не показан метод webhook");
+            require(finding(result, 10).evidence().contains("сборка по символам"),
+                    "не указан способ сборки по символам");
+            require(result.hasEvidenceRule(1),
+                    "собранный вебхук должен считаться Discord-вебхуком");
+        });
+
+        check("Сканер: fractureiser - 10 очков", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("fractureiser.jar"));
+            assertPointsAndRules(result, 10, Set.of(7));
+            require(finding(result, 7).location().contains("FractureiserTest"),
+                    "в месте находки нет класса FractureiserTest");
+            require(finding(result, 7).location().contains("marker"),
+                    "в месте находки нет метода marker");
+        });
+
+        check("Сканер: obfuscated - длинная строка и короткие имена", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("obfuscated.jar"));
+            assertPointsAndRules(result, 2, Set.of(18, 20));
+        });
+
+        check("Сканер: Base64 в текстовом файле", () -> {
+            String encoded = Base64.getEncoder().encodeToString(
+                    HIDDEN_WEBHOOK.getBytes(StandardCharsets.UTF_8));
+            Path jar = writeJar(tempDir, "hidden_base64.jar", Map.of(
+                    "assets/data.txt", utf8(encoded)
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 7, Set.of(9));
+            require(result.hasEvidenceRule(1), "Base64-вебхук не отмечен как вебхук");
+            require(finding(result, 9).evidence().contains("Base64"),
+                    "не указано, что строка была в Base64");
+        });
+
+        check("Сканер: hex в текстовом файле", () -> {
+            Path jar = writeJar(tempDir, "hidden_hex.jar", Map.of(
+                    "assets/data.txt", utf8(hex("api.telegram.org"))
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 6, Set.of(9));
+            require(result.hasEvidenceRule(2), "hex-Telegram не отмечен как Telegram");
+            require(finding(result, 9).evidence().contains("hex"),
+                    "не указано, что строка была в hex");
+        });
+
+        check("Сканер: перевёрнутая строка", () -> {
+            Path jar = writeJar(tempDir, "hidden_reverse.jar", Map.of(
+                    "assets/data.txt", utf8(reverse("wallet.dat"))
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 6, Set.of(9));
+            require(result.hasEvidenceRule(6), "перевёрнутый wallet.dat не отмечен");
+            require(finding(result, 9).evidence().contains("перевёрнутая"),
+                    "не указано, что строка была перевёрнута");
+        });
+
+        check("Сканер: длинная случайная строка в .txt не даёт правило 18", () -> {
+            String token = randomToken(80, 42L);
+            require(entropy(token) >= 4.8,
+                    "тестовая строка должна была бы дать правило 18 без фильтра");
+            Path jar = writeJar(tempDir, "long_string_txt.jar", Map.of(
+                    "assets/notes.txt", utf8(token)
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            require(!result.hasRule(18),
+                    "в .txt правило 18 не должно срабатывать");
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        check("Сканер: длинная случайная строка в .json не даёт правило 18", () -> {
+            String token = randomToken(120, 4242L);
+            require(entropy(token) >= 4.8,
+                    "тестовая строка должна была бы дать правило 18 без фильтра");
+            Path jar = writeJar(tempDir, "long_string_json.jar", Map.of(
+                    "assets/data.json", utf8("{\"token\":\"" + token + "\"}")
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            require(!result.hasRule(18),
+                    "в .json правило 18 не должно срабатывать");
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        check("Сканер: 64 разных символа - алфавит, а не случайная строка", () -> {
+            String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+_";
+            require(alphabet.length() == 64, "в алфавите должно быть 64 символа");
+            require(entropy(alphabet) >= 6.0,
+                    "у 64 разных символов должна быть энтропия 6.00");
+
+            Path jar = writeJar(tempDir, "alphabet64.jar", Map.of(
+                    "testmods/alphabet/Alphabet.class",
+                    classWithString("testmods/alphabet/Alphabet", alphabet)
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            require(!result.hasRule(18),
+                    "таблица из 64 разных символов не должна давать правило 18");
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        check("Сканер: правило 18 игнорирует не-ASCII строку в .class", () -> {
+            String token = randomUnicodeToken(80, 42L);
+            require(entropy(token) >= 4.8,
+                    "тестовая не-ASCII строка должна была бы дать правило 18 без фильтра");
+
+            Path jar = writeJar(tempDir, "long_string_unicode_class.jar", Map.of(
+                    "testmods/font/FontTable.class",
+                    classWithString("testmods/font/FontTable", token)
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        byte[] randomBytes = new byte[4096];
+        new Random(20261020L).nextBytes(randomBytes);
+
+        check("Сканер: большой файл с высокой энтропией", () -> {
+            Path jar = writeJar(tempDir, "high_entropy.jar", Map.of(
+                    "assets/payload.bin", randomBytes
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 2, Set.of(19));
+        });
+
+        check("Сканер: .png с высокой энтропией исключён", () -> {
+            Path jar = writeJar(tempDir, "high_entropy_png.jar", Map.of(
+                    "assets/picture.png", randomBytes
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        check("Сканер: медиа и шрифты исключены из правила 19", () -> {
+            Map<String, byte[]> entries = new LinkedHashMap<>();
+            entries.put("assets/track.mp3", randomBytes);
+            entries.put("assets/picture.webp", randomBytes);
+            entries.put("assets/animation.gif", randomBytes);
+            entries.put("assets/photo.jpeg", randomBytes);
+            entries.put("assets/font.woff", randomBytes);
+            entries.put("assets/font.woff2", randomBytes);
+
+            Path jar = writeJar(tempDir, "high_entropy_media.jar", entries);
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        check("Сканер: подписи META-INF исключены из правила 19", () -> {
+            Map<String, byte[]> entries = new LinkedHashMap<>();
+            entries.put("META-INF/TEST.RSA", randomBytes);
+            entries.put("META-INF/TEST.DSA", randomBytes);
+            entries.put("META-INF/TEST.EC", randomBytes);
+
+            Path jar = writeJar(tempDir, "high_entropy_signatures.jar", entries);
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        check("Сканер: не-ASCII имена классов", () -> {
+            byte[] cleanClass = readEntries(modsDir.resolve("clean.jar"))
+                    .get("testmods/clean/CleanMod.class");
+            require(cleanClass != null, "не найден класс для теста имён");
+
+            Map<String, byte[]> entries = new LinkedHashMap<>();
+            entries.put("testmods/unicode/Класс.class", cleanClass);
+            entries.put("testmods/unicode/a.class", cleanClass);
+            entries.put("testmods/unicode/b.class", cleanClass);
+            entries.put("testmods/unicode/c.class", cleanClass);
+            entries.put("testmods/unicode/d.class", cleanClass);
+            Path jar = writeJar(tempDir, "unicode_names.jar", entries);
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 1, Set.of(21));
+        });
+
+        check("Сканер: broken - ошибка без падения", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("broken.jar"));
+            require(result.hasError(), "ожидалась ошибка чтения broken.jar");
+            require(result.error().contains("битый"), "неожиданный текст ошибки: " + result.error());
+            require(result.points() == 0, "у битого файла не должно быть очков");
+        });
+
+        check("Сканер: финальные очки всех 9 тестовых модов", () -> {
+            assertFinalPoints(scanner, modsDir.resolve("clean.jar"), 0);
+            assertFinalPoints(scanner, modsDir.resolve("discord_integration.jar"), 6);
+            assertFinalPoints(scanner, modsDir.resolve("stealer.jar"), 12);
+            assertFinalPoints(scanner, modsDir.resolve("hidden_stealer.jar"), 15);
+            assertFinalPoints(scanner, modsDir.resolve("xor_stealer.jar"), 13);
+            assertFinalPoints(scanner, modsDir.resolve("loader.jar"), 13);
+            assertFinalPoints(scanner, modsDir.resolve("fractureiser.jar"), 10);
+            assertFinalPoints(scanner, modsDir.resolve("obfuscated.jar"), 2);
+
+            ModScanResult broken = scanner.scan(modsDir.resolve("broken.jar"));
+            require(broken.hasError(), "ожидалась ошибка чтения broken.jar");
+            require(broken.error().equals("файл битый или не мод"),
+                    "неожиданный текст ошибки: " + broken.error());
+            require(broken.verdict() == Verdict.ERROR,
+                    "у битого файла ожидался вердикт ОШИБКА");
+        });
+
+        check("Сканер: discord_integration не получает КРАЖУ", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("discord_integration.jar"));
+            require(result.links().stream()
+                            .noneMatch(link -> link.name().equals("КРАЖА")),
+                    "discord_integration не должен получать связку КРАЖА: " + result.links());
+            require(result.linkPoints() == 0,
+                    "у discord_integration не должно быть очков за связки");
+        });
+
+        check("Вердикт: порог 10 для всех 9 тестовых модов", () -> {
+            assertVerdict(scanner, modsDir.resolve("clean.jar"), Verdict.UNKNOWN);
+            assertVerdict(scanner, modsDir.resolve("discord_integration.jar"), Verdict.UNKNOWN);
+            assertVerdict(scanner, modsDir.resolve("stealer.jar"), Verdict.SUSPICIOUS);
+            assertVerdict(scanner, modsDir.resolve("hidden_stealer.jar"), Verdict.SUSPICIOUS);
+            assertVerdict(scanner, modsDir.resolve("xor_stealer.jar"), Verdict.SUSPICIOUS);
+            assertVerdict(scanner, modsDir.resolve("loader.jar"), Verdict.SUSPICIOUS);
+            assertVerdict(scanner, modsDir.resolve("fractureiser.jar"), Verdict.SUSPICIOUS);
+            assertVerdict(scanner, modsDir.resolve("obfuscated.jar"), Verdict.UNKNOWN);
+            assertVerdict(scanner, modsDir.resolve("broken.jar"), Verdict.ERROR);
+        });
+
+        check("Вердикт: подтверждение сайта переводит НЕИЗВЕСТНО в ОК", () -> {
+            ModScanResult result = new ModScanResult(Path.of("clean.jar"));
+            require(result.points() == 0, "у пустого результата не должно быть очков");
+            require(result.verdict() == Verdict.UNKNOWN,
+                    "без подтверждения сайта ожидался вердикт НЕИЗВЕСТНО");
+            result.markOnlineConfirmed();
+            require(result.verdict() == Verdict.OK,
+                    "после подтверждения сайта ожидался вердикт ОК");
+        });
+
+        check("Вердикт: 7 очков и подтверждение сайта дают ОК", () -> {
+            ModScanResult result = new ModScanResult(Path.of("confirmed7.jar"));
+            result.addFinding(new Finding(15, "Путь", 2, "test", "test"));
+            result.addFinding(new Finding(18, "Длинная строка", 1, "test", "test"));
+            result.addFinding(new Finding(12, "Загрузка кода", 4, "test", "test"));
+
+            require(result.points() == 7, "ожидалось 7 очков");
+            require(result.verdict() == Verdict.UNKNOWN,
+                    "до подтверждения сайта 7 очков должны давать НЕИЗВЕСТНО");
+            result.markOnlineConfirmed();
+            require(result.verdict() == Verdict.OK,
+                    "подтверждение сайта должно переводить 7 очков в ОК");
+        });
+
+        check("Modrinth: разбор ответа и User-Agent", () -> {
+            require(OnlineChecker.USER_AGENT.equals("modchecker/1.0"),
+                    "неверный User-Agent для Modrinth");
+            require(OnlineChecker.parseModrinthResponse(
+                            "abc", "{\"abc\":{\"id\":\"version\"}}")
+                            == OnlineStatus.CONFIRMED,
+                    "ответ с найденным хешем не распознан");
+            require(OnlineChecker.parseModrinthResponse(
+                            "abc", "{\"ABC\":{\"id\":\"version\"}}")
+                            == OnlineStatus.CONFIRMED,
+                    "хеш должен сравниваться без учёта регистра");
+            require(OnlineChecker.parseModrinthResponse("abc", "{}")
+                            == OnlineStatus.NOT_FOUND,
+                    "пустой ответ должен означать «не найдено»");
+            require(OnlineChecker.parseModrinthResponse("abc", "not-json")
+                            == OnlineStatus.SKIPPED,
+                    "битый ответ должен означать «проверка пропущена»");
+            require(new OnlineCheckResult("x",
+                            OnlineStatus.CONFIRMED, OnlineStatus.SKIPPED).confirmed(),
+                    "подтверждение Modrinth должно считаться подтверждением");
+        });
+
+        check("CurseForge: разбор ответа и 403", () -> {
+            require(OnlineChecker.parseCurseForgeResponse(403, "")
+                            == OnlineStatus.INVALID_KEY,
+                    "403 должен давать статус недействительного ключа");
+            require(OnlineStatus.INVALID_KEY.label().contains("недействителен")
+                            && OnlineStatus.INVALID_KEY.label().contains("не одобрен"),
+                    "статус 403 должен упоминать недействительный/неодобренный ключ");
+            require(OnlineChecker.parseCurseForgeResponse(200,
+                            "{\"data\":{\"exactMatches\":[{\"id\":1}]}}")
+                            == OnlineStatus.CONFIRMED,
+                    "exactMatches не распознан как подтверждение");
+            require(OnlineChecker.parseCurseForgeResponse(200,
+                            "{\"data\":{\"exactMatches\":[]}}")
+                            == OnlineStatus.NOT_FOUND,
+                    "пустой exactMatches должен означать «не найдено»");
+            require(OnlineChecker.parseCurseForgeResponse(200, "{}")
+                            == OnlineStatus.SKIPPED,
+                    "битый ответ CurseForge должен пропускать проверку");
+        });
+
+        check("CurseForge: без ключа проверка пропущена", () -> {
+            Path missingKey = tempDir.resolve("missing_curseforge_key.txt");
+            Files.deleteIfExists(missingKey);
+            OnlineChecker checker = new OnlineChecker(missingKey);
+            require(checker.checkCurseForge(123L) == OnlineStatus.SKIPPED,
+                    "без ключа проверка CurseForge должна быть пропущена");
+            require(OnlineStatus.SKIPPED.label().equals("проверка пропущена"),
+                    "неверный текст статуса пропущенной проверки");
+
+            Path keyFile = tempDir.resolve("curseforge_key_test.txt");
+            Files.writeString(keyFile, "  test-key\n", StandardCharsets.UTF_8);
+            require("test-key".equals(OnlineChecker.readKey(keyFile)),
+                    "ключ CurseForge не обрезан от пробелов");
+            require(OnlineChecker.readKey(missingKey) == null,
+                    "отсутствующий ключ должен читаться как null");
+        });
+
+        check("CurseForge: ключ в папке запуска важнее ~/.modchecker", () -> {
+            Path workDir = Files.createDirectories(tempDir.resolve("key-work"));
+            Path homeDir = Files.createDirectories(tempDir.resolve("key-home"));
+            Path localKey = workDir.resolve("curseforge_key.txt");
+            Path globalKey = homeDir.resolve(".modchecker").resolve("curseforge_key.txt");
+
+            Files.deleteIfExists(localKey);
+            Files.deleteIfExists(globalKey);
+            require(OnlineChecker.readKeyFrom(workDir, homeDir) == null,
+                    "без файлов ключ должен отсутствовать");
+
+            Files.createDirectories(globalKey.getParent());
+            Files.writeString(globalKey, "global-key\n", StandardCharsets.UTF_8);
+            require("global-key".equals(OnlineChecker.readKeyFrom(workDir, homeDir)),
+                    "не сработал запасной ключ из ~/.modchecker");
+
+            Files.writeString(localKey, "local-key\n", StandardCharsets.UTF_8);
+            require("local-key".equals(OnlineChecker.readKeyFrom(workDir, homeDir)),
+                    "ключ из папки запуска должен быть важнее запасного");
+        });
+
+        check("Отчёт: в выводе нет длинного тире и стрелки", () -> {
+            ModScanResult result = scanner.scan(modsDir.resolve("hidden_stealer.jar"));
+            OnlineCheckResult online = new OnlineCheckResult(
+                    "0000000000000000000000000000000000000000",
+                    OnlineStatus.SKIPPED,
+                    OnlineStatus.SKIPPED);
+
+            String text = renderReport(result, online);
+            require(!text.contains("\u2014") && !text.contains("\u2013")
+                            && !text.contains("\u2192"),
+                    "в выводе остались неконсольные символы: " + text);
+            require(text.contains(" - "),
+                    "в выводе нет обычного дефиса между частями строки");
+            require(text.contains("Base64 -> Discord"),
+                    "стрелка в доказательстве не заменена на ->");
+        });
+
+        check("Отчёт: последние две строки и итоги", () -> {
+            ModScanResult clean = new ModScanResult(Path.of("clean.jar"));
+            OnlineCheckResult online = new OnlineCheckResult(
+                    "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                    OnlineStatus.SKIPPED,
+                    OnlineStatus.INVALID_KEY);
+
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (PrintStream out = new PrintStream(
+                    bytes, true, StandardCharsets.UTF_8)) {
+                ReportPrinter.print(List.of(new ModReport(clean, online)), out);
+            }
+
+            String text = bytes.toString(StandardCharsets.UTF_8);
+            String expectedEnd = "Подтверждение с сайта = файл тот же, "
+                    + "что на официальной странице."
+                    + System.lineSeparator()
+                    + "ПОДОЗРИТЕЛЬНО = проверь сам, это не приговор."
+                    + System.lineSeparator();
+
+            require(text.endsWith(expectedEnd),
+                    "последние две строки отчёта напечатаны неверно");
+            require(text.contains("SHA-1: da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+                    "в отчёте нет SHA-1");
+            require(text.contains("Modrinth: проверка пропущена"),
+                    "в отчёте нет статуса Modrinth");
+            require(text.contains("CurseForge: ключ недействителен или не одобрен (403)"),
+                    "в отчёте нет статуса CurseForge для 403");
+            require(text.contains("=== ИТОГО ==="),
+                    "в отчёте нет блока итогов");
+            require(text.contains("Проверено модов: 1"),
+                    "в отчёте нет количества модов");
+        });
+
+        check("Отчёт: format совпадает с консольным выводом", () -> {
+            ModScanResult hidden = scanner.scan(modsDir.resolve("hidden_stealer.jar"));
+            OnlineCheckResult online = new OnlineCheckResult(
+                    "0000000000000000000000000000000000000000",
+                    OnlineStatus.SKIPPED,
+                    OnlineStatus.SKIPPED);
+            ModReport report = new ModReport(hidden, online);
+
+            String printed = renderReport(hidden, online);
+            String formatted = ReportPrinter.format(List.of(report));
+            require(formatted.equals(printed),
+                    "ReportPrinter.format не совпадает с консольным выводом");
+
+            String details = ReportPrinter.formatMod(report);
+            require(details.contains("=== hidden_stealer.jar ==="),
+                    "в подробностях мода нет заголовка");
+            require(details.contains("SHA-1:"),
+                    "в подробностях мода нет SHA-1");
+            require(details.contains("Base64 -> Discord"),
+                    "в подробностях мода нет стрелки ->");
+            require(details.contains("КРАЖА"),
+                    "в подробностях мода нет связки КРАЖА");
+
+            String secret = "cf-secret-should-not-be-printed";
+            require(!formatted.contains(secret) && !details.contains(secret),
+                    "ключ не должен попадать в отчёт");
+        });
+
+        check("Ключ: сохранение, загрузка и удаление", () -> {
+            Path keyFile = tempDir.resolve("gui-key").resolve("curseforge_key.txt");
+            Files.deleteIfExists(keyFile);
+
+            CurseForgeKeyStore.save(keyFile, "  test-key\n");
+            require("test-key".equals(CurseForgeKeyStore.load(keyFile)),
+                    "сохранённый ключ не загрузился");
+            require(CurseForgeKeyStore.delete(keyFile),
+                    "сохранённый ключ не удалился");
+            require(!Files.exists(keyFile),
+                    "файл ключа остался после удаления");
+            require(CurseForgeKeyStore.load(keyFile) == null,
+                    "удалённый ключ всё ещё читается");
+
+            CurseForgeKeyStore.save(keyFile, "   ");
+            require(!Files.exists(keyFile),
+                    "пустой ключ должен удалять файл, а не создавать его");
+        });
+
+        check("Ключ: статусы проверки 200/403/нет сети", () -> {
+            require(OnlineChecker.parseKeyCheckResponse(200) == KeyCheckStatus.WORKING,
+                    "200 должен означать рабочий ключ");
+            require(OnlineChecker.parseKeyCheckResponse(403) == KeyCheckStatus.INVALID,
+                    "403 должен означать неверный ключ");
+            require(OnlineChecker.parseKeyCheckResponse(500) == KeyCheckStatus.ERROR,
+                    "500 не должен выдаваться за неверный ключ");
+            require(KeyCheckStatus.INVALID.label()
+                            .equals("ключ неверный или не одобрен (403)"),
+                    "неверный текст статуса 403");
+            require(KeyCheckStatus.NO_NETWORK.label().equals("нет сети"),
+                    "неверный текст статуса без сети");
+            require(KeyCheckStatus.EMPTY.label().equals("ключ не введён"),
+                    "неверный текст пустого ключа");
+        });
+
+        check("Поиск модов: один jar и папка без подпапок", () -> {
+            Path finderDir = Files.createDirectories(tempDir.resolve("finder"));
+            Path one = Files.writeString(finderDir.resolve("one.jar"), "x");
+            Files.writeString(finderDir.resolve("note.txt"), "x");
+            Path sub = Files.createDirectories(finderDir.resolve("sub"));
+            Files.writeString(sub.resolve("two.jar"), "x");
+
+            require(ModFinder.find(finderDir).equals(List.of(one)),
+                    "папка должна давать только one.jar: " + ModFinder.find(finderDir));
+            require(ModFinder.find(one).equals(List.of(one)),
+                    "одиночный jar должен возвращаться как есть");
+            require(ModFinder.find(Files.createDirectories(
+                            tempDir.resolve("finder-empty"))).isEmpty(),
+                    "пустая папка должна давать пустой список");
+
+            boolean thrown = false;
+            try {
+                ModFinder.find(tempDir.resolve("finder-missing"));
+            } catch (IOException e) {
+                thrown = true;
+            }
+            require(thrown, "несуществующий путь должен давать ошибку");
+        });
+
+        check("Таблица: колонки и порядок по умолчанию", () -> {
+            ModTableModel model = new ModTableModel();
+            model.setReports(List.of(
+                    tableReport("clean.jar", 0, false, true),
+                    tableReport("unknown.jar", 0, false, false),
+                    tableReport("stealer.jar", 12, false, false),
+                    tableReport("loader.jar", 15, false, false),
+                    tableReport("broken.jar", 0, true, false)
+            ));
+
+            require(model.getColumnName(0).equals("Мод")
+                            && model.getColumnName(1).equals("Вердикт")
+                            && model.getColumnName(2).equals("Очки")
+                            && model.getColumnName(3).equals("Modrinth")
+                            && model.getColumnName(4).equals("CurseForge"),
+                    "неверные названия колонок таблицы");
+
+            var sorter = ModTableModel.createSorter(model);
+            sorter.sort();
+
+            ModReport first = model.reportAt(sorter.convertRowIndexToModel(0));
+            ModReport second = model.reportAt(sorter.convertRowIndexToModel(1));
+            ModReport third = model.reportAt(sorter.convertRowIndexToModel(2));
+            ModReport fourth = model.reportAt(sorter.convertRowIndexToModel(3));
+            ModReport fifth = model.reportAt(sorter.convertRowIndexToModel(4));
+
+            require(first.scan().verdict() == Verdict.SUSPICIOUS
+                            && first.scan().points() == 15,
+                    "первым должен идти ПОДОЗРИТЕЛЬНО с 15 очками");
+            require(second.scan().verdict() == Verdict.SUSPICIOUS
+                            && second.scan().points() == 12,
+                    "среди подозрительных очки должны идти по убыванию");
+            require(third.scan().verdict() == Verdict.UNKNOWN,
+                    "после подозрительных должно идти НЕИЗВЕСТНО");
+            require(fourth.scan().verdict() == Verdict.OK,
+                    "после неизвестных должно идти ОК");
+            require(fifth.scan().verdict() == Verdict.ERROR,
+                    "последней должна идти ОШИБКА");
+        });
+
+        Map<String, byte[]> allRuleEntries = new LinkedHashMap<>();
+        allRuleEntries.put("assets/config.json",
+                utf8("discord.com/api/webhooks\napi.telegram.org"));
+        allRuleEntries.put("data/app.properties",
+                utf8("launcher_accounts\nLocal Storage\nCookies"));
+        allRuleEntries.put("data/settings.cfg",
+                utf8("wallet.dat\ndev/neko\npastebin.com"));
+        allRuleEntries.put("notes.txt",
+                utf8("discord.com/api/webhooks"));
+        Path allRulesJar = writeJar(tempDir, "all_rules.jar", allRuleEntries);
+
+        check("Сканер: правила 1-8 и связка КРАЖА в текстовых файлах", () -> {
+            ModScanResult result = scanner.scan(allRulesJar);
+            assertPointsRulesAndLinks(result, 33,
+                    Set.of(1, 2, 3, 4, 5, 6, 7, 8), Set.of("КРАЖА"));
+            require(link(result, "КРАЖА").evidence().contains("1 + 3"),
+                    "связка должна использовать первые подходящие правила 1 и 3");
+        });
+
+        Path unknownExtension = writeJar(tempDir, "unknown_extension.jar", Map.of(
+                "assets/data.bin", utf8("api.telegram.org")
+        ));
+
+        check("Сканер: файл неизвестного типа не сканируется как текст", () -> {
+            ModScanResult result = scanner.scan(unknownExtension);
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        Map<String, byte[]> executables = new LinkedHashMap<>();
+        executables.put("bin/tool.exe", utf8("not a real executable"));
+        executables.put("bin/run.bat", utf8("echo hello"));
+        Path executableJar = writeJar(tempDir, "executables.jar", executables);
+
+        check("Сканер: правило 17 считается один раз", () -> {
+            ModScanResult result = scanner.scan(executableJar);
+            assertPointsAndRules(result, 4, Set.of(17));
+            require(result.findings().size() == 1,
+                    "два исполняемых файла должны дать только одну находку");
+        });
+
+        byte[] level3 = zipBytes(Map.of("too_deep.txt", utf8("wallet.dat")));
+
+        Map<String, byte[]> level2Entries = new LinkedHashMap<>();
+        level2Entries.put("deep.txt",
+                utf8("https://discord.com/api/webhooks/42/nested"));
+        level2Entries.put("payload.exe", utf8("not a real executable"));
+        level2Entries.put("level3.jar", level3);
+        byte[] level2 = zipBytes(level2Entries);
+
+        byte[] level1 = zipBytes(Map.of("level2.jar", level2));
+        Path nestedJar = writeJar(tempDir, "nested.jar", Map.of("level1.jar", level1));
+
+        check("Сканер: вложенные jar до двух уровней", () -> {
+            ModScanResult result = scanner.scan(nestedJar);
+            assertPointsAndRules(result, 8, Set.of(1, 17));
+
+            require(finding(result, 1).location()
+                            .contains("level1.jar!/level2.jar!/deep.txt"),
+                    "не показан полный путь вложенного файла: "
+                            + finding(result, 1).location());
+            require(finding(result, 17).location()
+                            .contains("level1.jar!/level2.jar!/payload.exe"),
+                    "для вложенного exe не показан путь: "
+                            + finding(result, 17).location());
+            require(!result.hasRule(6),
+                    "файл третьего уровня не должен проверяться");
+        });
+    }
+
+    private static void assertPointsAndRules(ModScanResult result, int expectedPoints,
+                                             Set<Integer> expectedRules) {
+        assertPointsRulesAndLinks(result, expectedPoints, expectedRules, Set.of());
+    }
+
+    private static void assertPointsRulesAndLinks(ModScanResult result, int expectedPoints,
+                                                  Set<Integer> expectedRules,
+                                                  Set<String> expectedLinks) {
+        require(!result.hasError(), "неожиданная ошибка: " + result.error());
+
+        Set<Integer> actualRules = new LinkedHashSet<>();
+        for (Finding finding : result.findings()) {
+            actualRules.add(finding.rule());
+        }
+        Set<String> actualLinks = new LinkedHashSet<>();
+        for (LinkFinding link : result.links()) {
+            actualLinks.add(link.name());
+        }
+
+        require(result.points() == expectedPoints,
+                "ожидалось очков " + expectedPoints + ", получено " + result.points()
+                        + "; правила: " + actualRules + "; связки: " + actualLinks);
+        require(actualRules.equals(expectedRules),
+                "ожидались правила " + expectedRules + ", получены " + actualRules);
+        require(actualLinks.equals(expectedLinks),
+                "ожидались связки " + expectedLinks + ", получены " + actualLinks);
+    }
+
+    private static void assertFinalPoints(ScanService scanner, Path file, int expectedPoints) {
+        ModScanResult result = scanner.scan(file);
+        require(!result.hasError(),
+                file.getFileName() + ": неожиданная ошибка: " + result.error());
+        require(result.points() == expectedPoints,
+                file.getFileName() + ": ожидалось очков " + expectedPoints
+                        + ", получено " + result.points()
+                        + "; находки: " + result.findings()
+                        + "; связки: " + result.links());
+    }
+
+    private static void assertVerdict(ScanService scanner, Path file, Verdict expectedVerdict) {
+        ModScanResult result = scanner.scan(file);
+        require(result.verdict() == expectedVerdict,
+                file.getFileName() + ": ожидался вердикт " + expectedVerdict.label()
+                        + ", получен " + result.verdict().label()
+                        + " (" + result.points() + " очков)"
+                        + (result.hasError() ? ", ошибка: " + result.error() : ""));
+    }
+
+    private static ModReport tableReport(String name, int points,
+                                         boolean error, boolean confirmed) {
+        ModScanResult scan = new ModScanResult(Path.of(name));
+        if (error) {
+            scan.markError("файл битый или не мод");
+        }
+        if (points > 0) {
+            scan.addFinding(new Finding(7, "Тест", points, "test", "test"));
+        }
+        if (confirmed) {
+            scan.markOnlineConfirmed();
+        }
+        OnlineCheckResult online = new OnlineCheckResult(
+                "0".repeat(40), OnlineStatus.SKIPPED, OnlineStatus.SKIPPED);
+        return new ModReport(scan, online);
+    }
+
+    private static Finding finding(ModScanResult result, int rule) {
+        return result.findings().stream()
+                .filter(finding -> finding.rule() == rule)
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "нет находки правила " + rule + " в " + result.name()));
+    }
+
+    private static LinkFinding link(ModScanResult result, String name) {
+        return result.links().stream()
+                .filter(link -> link.name().equals(name))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "нет связки " + name + " в " + result.name()));
+    }
+
+    private static byte[] classWithString(String className, String value) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        MethodVisitor method = writer.visitMethod(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "value", "()Ljava/lang/String;", null, null);
+        method.visitCode();
+        method.visitLdcInsn(value);
+        method.visitInsn(Opcodes.ARETURN);
+        method.visitMaxs(1, 0);
+        method.visitEnd();
+
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] classWithStringAndDefineClass(String className, String value) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        MethodVisitor method = writer.visitMethod(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "load", "([B)Ljava/lang/Class;", null, null);
+        method.visitCode();
+        method.visitLdcInsn(value);
+        method.visitInsn(Opcodes.POP);
+        method.visitVarInsn(Opcodes.ALOAD, 0);
+        method.visitInsn(Opcodes.ICONST_0);
+        method.visitVarInsn(Opcodes.ALOAD, 0);
+        method.visitInsn(Opcodes.ARRAYLENGTH);
+        method.visitMethodInsn(Opcodes.INVOKESTATIC,
+                "java/lang/ClassLoader", "defineClass",
+                "([BII)Ljava/lang/Class;", false);
+        method.visitInsn(Opcodes.ARETURN);
+        method.visitMaxs(4, 1);
+        method.visitEnd();
+
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static Path writeJar(Path directory, String name,
+                                 Map<String, byte[]> entries) throws IOException {
+        Path jar = directory.resolve(name);
+        try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(jar))) {
+            for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
+                zip.putNextEntry(new ZipEntry(entry.getKey()));
+                zip.write(entry.getValue());
+                zip.closeEntry();
+            }
+        }
+        return jar;
+    }
+
+    private static byte[] zipBytes(Map<String, byte[]> entries) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(output)) {
+            for (Map.Entry<String, byte[]> entry : entries.entrySet()) {
+                zip.putNextEntry(new ZipEntry(entry.getKey()));
+                zip.write(entry.getValue());
+                zip.closeEntry();
+            }
+        }
+        return output.toByteArray();
+    }
+
+    private static byte[] utf8(String text) {
+        return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static String hex(String text) {
+        StringBuilder result = new StringBuilder();
+        for (byte value : text.getBytes(StandardCharsets.UTF_8)) {
+            result.append(Character.forDigit((value >> 4) & 0x0F, 16));
+            result.append(Character.forDigit(value & 0x0F, 16));
+        }
+        return result.toString();
+    }
+
+    private static String reverse(String text) {
+        return new StringBuilder(text).reverse().toString();
+    }
+
+    private static String randomToken(int length, long seed) {
+        Random random = new Random(seed);
+        String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        StringBuilder result = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            result.append(alphabet.charAt(random.nextInt(alphabet.length())));
+        }
+        return result.toString();
+    }
+
+    private static String randomUnicodeToken(int length, long seed) {
+        Random random = new Random(seed);
+        StringBuilder result = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            result.append((char) (0x0410 + random.nextInt(64)));
+        }
+        return result.toString();
+    }
+
+    private static String renderReport(ModScanResult scan, OnlineCheckResult online) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (PrintStream out = new PrintStream(
+                bytes, true, StandardCharsets.UTF_8)) {
+            ReportPrinter.print(List.of(new ModReport(scan, online)), out);
+        }
+        return bytes.toString(StandardCharsets.UTF_8);
+    }
+
+    private static boolean hasUrlClassLoaderInStaticInitializer(byte[] classBytes) {
+        boolean[] found = {false};
+        ClassReader reader = new ClassReader(classBytes);
+        reader.accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                             String signature, String[] exceptions) {
+                if (!"<clinit>".equals(name)) {
+                    return null;
+                }
+                return new MethodVisitor(Opcodes.ASM9) {
+                    @Override
+                    public void visitTypeInsn(int opcode, String type) {
+                        if ("java/net/URLClassLoader".equals(type)) {
+                            found[0] = true;
+                        }
+                    }
+
+                    @Override
+                    public void visitMethodInsn(int opcode, String owner, String name,
+                                                String descriptor, boolean isInterface) {
+                        if ("java/net/URLClassLoader".equals(owner)) {
+                            found[0] = true;
+                        }
+                    }
+                };
+            }
+        }, 0);
+        return found[0];
+    }
+
+    private static boolean hasOpcode(Map<String, byte[]> entries, int opcode) {
+        boolean[] found = {false};
+        for (byte[] classBytes : classEntries(entries).values()) {
+            ClassReader reader = new ClassReader(classBytes);
+            reader.accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                                 String signature, String[] exceptions) {
+                    return new MethodVisitor(Opcodes.ASM9) {
+                        @Override
+                        public void visitInsn(int instruction) {
+                            if (instruction == opcode) {
+                                found[0] = true;
+                            }
+                        }
+                    };
+                }
+            }, 0);
+        }
+        return found[0];
+    }
+
+    private static List<String> stringConstants(byte[] classBytes) {
+        List<String> result = new ArrayList<>();
+        ClassReader reader = new ClassReader(classBytes);
+        reader.accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                             String signature, String[] exceptions) {
+                return new MethodVisitor(Opcodes.ASM9) {
+                    @Override
+                    public void visitLdcInsn(Object value) {
+                        if (value instanceof String string) {
+                            result.add(string);
+                        }
+                    }
+                };
+            }
+        }, 0);
+        return result;
+    }
+
+    private static Map<String, byte[]> classEntries(Map<String, byte[]> entries) {
+        Map<String, byte[]> result = new LinkedHashMap<>();
+        entries.forEach((name, bytes) -> {
+            if (name.endsWith(".class")) {
+                result.put(name, bytes);
+            }
+        });
+        return result;
+    }
+
+    private static boolean containsInAnyEntry(Map<String, byte[]> entries, String text) {
+        for (byte[] bytes : entries.values()) {
+            if (contains(bytes, text)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean contains(byte[] data, String text) {
+        byte[] needle = text.getBytes(StandardCharsets.ISO_8859_1);
+        outer:
+        for (int i = 0; i <= data.length - needle.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (data[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static Map<String, byte[]> readEntries(Path jar) throws IOException {
+        Map<String, byte[]> result = new LinkedHashMap<>();
+        try (ZipFile zip = new ZipFile(jar.toFile())) {
+            var entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                if (!entry.isDirectory()) {
+                    try (var input = zip.getInputStream(entry)) {
+                        result.put(entry.getName(), input.readAllBytes());
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    private static List<String> listJarNames(Path directory) throws IOException {
+        try (Stream<Path> paths = Files.list(directory)) {
+            return paths
+                    .filter(Files::isRegularFile)
+                    .map(path -> path.getFileName().toString())
+                    .filter(name -> name.endsWith(".jar"))
+                    .sorted(Comparator.naturalOrder())
+                    .toList();
+        }
+    }
+
+    private static double entropy(String text) {
+        if (text.isEmpty()) {
+            return 0.0;
+        }
+        Map<Character, Integer> counts = new LinkedHashMap<>();
+        for (int i = 0; i < text.length(); i++) {
+            counts.merge(text.charAt(i), 1, Integer::sum);
+        }
+        double result = 0.0;
+        for (int count : counts.values()) {
+            double probability = (double) count / text.length();
+            result -= probability * (Math.log(probability) / Math.log(2.0));
+        }
+        return result;
+    }
+
+    private static void require(boolean condition, String message) {
+        if (!condition) {
+            throw new IllegalStateException(message);
+        }
+    }
+
+    private static void check(String name, CheckedAction action) {
+        try {
+            action.run();
+            passed++;
+            System.out.println("[OK]   " + name);
+        } catch (Exception | AssertionError e) {
+            failed++;
+            System.out.println("[FAIL] " + name + ": " + e.getMessage());
+        }
+    }
+
+    @FunctionalInterface
+    private interface CheckedAction {
+        void run() throws Exception;
+    }
+}
