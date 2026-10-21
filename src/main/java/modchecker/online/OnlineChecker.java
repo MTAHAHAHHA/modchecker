@@ -25,7 +25,7 @@ import java.util.Map;
  */
 public final class OnlineChecker {
 
-    public static final String USER_AGENT = "modchecker/1.0";
+    public static final String USER_AGENT = "modchecker/1.2";
 
     private static final URI MODRINTH_URI =
             URI.create("https://api.modrinth.com/v2/version_files");

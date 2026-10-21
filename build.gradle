@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'modchecker'
-version = '1.1'
+version = '1.2'
 
 repositories {
     mavenCentral()
@@ -34,7 +34,9 @@ tasks.register('copyReadme', Copy) {
 tasks.named('shadowJar') {
     archiveFileName = 'modchecker.jar'
     manifest {
-        attributes 'Main-Class': 'modchecker.Main'
+        attributes 'Main-Class': 'modchecker.Main',
+                'Implementation-Title': 'ModChecker',
+                'Implementation-Version': project.version
     }
     finalizedBy tasks.named('copyReadme')
 }

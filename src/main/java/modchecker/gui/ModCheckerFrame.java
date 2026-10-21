@@ -104,7 +104,7 @@ public final class ModCheckerFrame extends JFrame {
     private volatile boolean scanning;
 
     public ModCheckerFrame() {
-        super("ModChecker");
+        super("ModChecker 1.2");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setMinimumSize(new Dimension(900, 650));
         setSize(1100, 760);

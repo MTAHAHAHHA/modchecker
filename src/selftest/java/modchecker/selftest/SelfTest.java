@@ -996,7 +996,7 @@ public final class SelfTest {
         });
 
         check("Modrinth: разбор ответа и User-Agent", () -> {
-            require(OnlineChecker.USER_AGENT.equals("modchecker/1.0"),
+            require(OnlineChecker.USER_AGENT.equals("modchecker/1.2"),
                     "неверный User-Agent для Modrinth");
             require(OnlineChecker.parseModrinthResponse(
                             "abc", "{\"abc\":{\"id\":\"version\"}}")
