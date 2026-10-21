@@ -1,0 +1,18 @@
+# Gradle
+build/
+.gradle/
+
+# Java
+*.class
+out/
+
+# Local secrets and reports
+curseforge_key.txt
+modchecker-report*.txt
+
+# IDE
+.idea/
+.vscode/
+
+# The Gradle wrapper files (gradlew, gradlew.bat, gradle/wrapper/*)
+# are intentionally tracked and must not be ignored.

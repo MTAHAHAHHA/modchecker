@@ -1,0 +1,594 @@
+package modchecker.scan;
+
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.Handle;
+import org.objectweb.asm.Label;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Разбирает байткод через ASM и ищет правила 10-16.
+ *
+ * ClassReader - только парсер. Классы модов не загружаются и не выполняются:
+ * здесь нет Class.forName, loadClass или URLClassLoader.
+ */
+final class BytecodeAnalyzer {
+
+    private static final int MAX_DECODED_ARRAY = 8192;
+    private static final int MAX_DECODED_STRING = 4096;
+
+    private BytecodeAnalyzer() {
+    }
+
+    static BytecodeAnalysis analyze(byte[] classBytes) {
+        List<MethodAnalyzer> methods = new ArrayList<>();
+        String[] className = {""};
+
+        ClassReader reader = new ClassReader(classBytes);
+        reader.accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public void visit(int version, int access, String name, String signature,
+                              String superName, String[] interfaces) {
+                className[0] = name.replace('/', '.');
+            }
+
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                             String signature, String[] exceptions) {
+                MethodAnalyzer method = new MethodAnalyzer(className[0], name);
+                methods.add(method);
+                return method;
+            }
+        }, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+
+        String name = className[0];
+        List<DangerousCall> calls = new ArrayList<>();
+        boolean dangerousInClinit = false;
+        List<DecodedCandidate> xorStrings = new ArrayList<>();
+        List<DecodedCandidate> assembledStrings = new ArrayList<>();
+        XorLoop xorLoop = null;
+
+        for (MethodAnalyzer method : methods) {
+            method.finish();
+
+            calls.addAll(method.calls());
+            if ("<clinit>".equals(method.methodName()) && !method.calls().isEmpty()) {
+                dangerousInClinit = true;
+            }
+            if (xorLoop == null && method.hasXorLoop()) {
+                xorLoop = new XorLoop(name, method.methodName());
+            }
+
+            for (String value : method.xorStrings()) {
+                xorStrings.add(new DecodedCandidate(value, method.methodName(), "XOR"));
+            }
+            for (String value : method.assembledStrings()) {
+                assembledStrings.add(new DecodedCandidate(
+                        value, method.methodName(), "сборка по символам"));
+            }
+        }
+
+        return new BytecodeAnalysis(
+                name,
+                List.copyOf(calls),
+                dangerousInClinit,
+                List.copyOf(deduplicate(xorStrings)),
+                List.copyOf(deduplicate(assembledStrings)),
+                xorLoop
+        );
+    }
+
+    private static List<DecodedCandidate> deduplicate(List<DecodedCandidate> candidates) {
+        Map<String, DecodedCandidate> unique = new LinkedHashMap<>();
+        for (DecodedCandidate candidate : candidates) {
+            unique.putIfAbsent(candidate.technique() + '\u0000' + candidate.value(), candidate);
+        }
+        return List.copyOf(unique.values());
+    }
+
+    private static final class MethodAnalyzer extends MethodVisitor {
+
+        private final String className;
+        private final String methodName;
+        private final List<DangerousCall> calls = new ArrayList<>();
+        private final List<ArrayValue> arrays = new ArrayList<>();
+        private final List<Integer> recentInts = new ArrayList<>();
+        private final Set<Label> visitedLabels = new HashSet<>();
+        private final Set<Integer> xorKeys = new LinkedHashSet<>();
+        private final List<String> builderStrings = new ArrayList<>();
+
+        private ArrayValue currentArray;
+        private StringBuilderCapture builder;
+        private Integer lastInt;
+        private String pendingString;
+        private boolean hasByteArray;
+        private boolean hasStringFromBytes;
+        private boolean hasStringFromChars;
+        private boolean hasXor;
+        private boolean backwardJump;
+        private boolean finished;
+        private final List<String> xorStrings = new ArrayList<>();
+        private final List<String> assembledStrings = new ArrayList<>();
+
+        private MethodAnalyzer(String className, String methodName) {
+            super(Opcodes.ASM9);
+            this.className = className;
+            this.methodName = methodName;
+        }
+
+        List<DangerousCall> calls() {
+            return calls;
+        }
+
+        String methodName() {
+            return methodName;
+        }
+
+        boolean hasXorLoop() {
+            return hasXor && backwardJump && hasByteArray;
+        }
+
+        List<String> xorStrings() {
+            return xorStrings;
+        }
+
+        List<String> assembledStrings() {
+            return assembledStrings;
+        }
+
+        @Override
+        public void visitInsn(int opcode) {
+            if (opcode >= Opcodes.ICONST_M1 && opcode <= Opcodes.ICONST_5) {
+                setInt(opcode - Opcodes.ICONST_0);
+                return;
+            }
+
+            switch (opcode) {
+                case Opcodes.IXOR -> {
+                    hasXor = true;
+                    if (lastInt != null) {
+                        xorKeys.add(lastInt);
+                    }
+                    clearPending();
+                    recentInts.clear();
+                }
+                case Opcodes.BASTORE, Opcodes.CASTORE -> {
+                    recordArrayWrite(opcode);
+                    clearPending();
+                    recentInts.clear();
+                }
+                case Opcodes.ASTORE -> {
+                    finishArray();
+                    clearPending();
+                    recentInts.clear();
+                }
+                default -> {
+                    clearPending();
+                    recentInts.clear();
+                }
+            }
+        }
+
+        @Override
+        public void visitIntInsn(int opcode, int operand) {
+            if (opcode == Opcodes.BIPUSH || opcode == Opcodes.SIPUSH) {
+                setInt(operand);
+                return;
+            }
+
+            if (opcode == Opcodes.NEWARRAY) {
+                startArray(operand);
+                return;
+            }
+
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitVarInsn(int opcode, int varIndex) {
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitTypeInsn(int opcode, String type) {
+            if (opcode == Opcodes.NEW && "java/lang/StringBuilder".equals(type)) {
+                builder = new StringBuilderCapture();
+            }
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
+            finishArray();
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitMethodInsn(int opcode, String owner, String name,
+                                    String descriptor, boolean isInterface) {
+            // Массив мог быть передан в метод или сохранён в поле: снимаем
+            // снимок до возможного цикла расшифровки.
+            finishArray();
+
+            int rule = ruleForCall(owner, name, descriptor);
+            if (rule != 0) {
+                calls.add(new DangerousCall(
+                        rule, className, methodName, owner, name, descriptor));
+            }
+
+            if (isStringFromBytes(owner, name, descriptor)) {
+                hasStringFromBytes = true;
+            }
+            if (isStringFromChars(owner, name, descriptor)) {
+                hasStringFromChars = true;
+            }
+
+            handleStringBuilder(owner, name, descriptor);
+
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitInvokeDynamicInsn(String name, String descriptor,
+                                           Handle bootstrapMethodHandle,
+                                           Object... bootstrapMethodArguments) {
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitJumpInsn(int opcode, Label label) {
+            if (visitedLabels.contains(label)) {
+                backwardJump = true;
+            }
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitLabel(Label label) {
+            visitedLabels.add(label);
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitLdcInsn(Object value) {
+            if (value instanceof Integer integer) {
+                setInt(integer);
+            } else if (value instanceof String string) {
+                pendingString = string;
+                lastInt = null;
+            } else {
+                clearPending();
+            }
+        }
+
+        @Override
+        public void visitIincInsn(int varIndex, int increment) {
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitTableSwitchInsn(int min, int max, Label dflt, Label... labels) {
+            if (visitedLabels.contains(dflt)) {
+                backwardJump = true;
+            }
+            for (Label label : labels) {
+                if (visitedLabels.contains(label)) {
+                    backwardJump = true;
+                }
+            }
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitLookupSwitchInsn(Label dflt, int[] keys, Label[] labels) {
+            if (visitedLabels.contains(dflt)) {
+                backwardJump = true;
+            }
+            for (Label label : labels) {
+                if (visitedLabels.contains(label)) {
+                    backwardJump = true;
+                }
+            }
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitMultiANewArrayInsn(String descriptor, int numDimensions) {
+            clearPending();
+            recentInts.clear();
+        }
+
+        @Override
+        public void visitEnd() {
+            finish();
+        }
+
+        void finish() {
+            if (finished) {
+                return;
+            }
+            finished = true;
+            finishArray();
+
+            Set<String> decoded = new LinkedHashSet<>();
+            if (hasStringFromBytes && hasXor) {
+                for (ArrayValue array : arrays) {
+                    if (array.type != Opcodes.T_BYTE) {
+                        continue;
+                    }
+                    for (int key : xorKeys) {
+                        String value = array.decodeXor(key);
+                        if (value != null) {
+                            decoded.add(value);
+                        }
+                    }
+                }
+            }
+            for (String value : decoded) {
+                addIfDangerous(xorStrings, value);
+            }
+
+            Set<String> assembled = new LinkedHashSet<>(builderStrings);
+            if (hasStringFromChars) {
+                for (ArrayValue array : arrays) {
+                    if (array.type == Opcodes.T_CHAR) {
+                        assembled.add(array.asChars());
+                    }
+                }
+            }
+            for (String value : assembled) {
+                addIfDangerous(assembledStrings, value);
+            }
+        }
+
+        private void setInt(int value) {
+            lastInt = value;
+            pendingString = null;
+            recentInts.add(value);
+            if (recentInts.size() > 3) {
+                recentInts.remove(0);
+            }
+        }
+
+        private void clearPending() {
+            lastInt = null;
+            pendingString = null;
+        }
+
+        private void startArray(int type) {
+            finishArray();
+            if (type == Opcodes.T_BYTE || type == Opcodes.T_CHAR) {
+                int length = lastInt != null ? Math.max(0, lastInt) : 0;
+                currentArray = new ArrayValue(type, length);
+                if (type == Opcodes.T_BYTE) {
+                    hasByteArray = true;
+                }
+            }
+            clearPending();
+            recentInts.clear();
+        }
+
+        private void recordArrayWrite(int opcode) {
+            if (currentArray == null || recentInts.size() < 2) {
+                return;
+            }
+            if (opcode == Opcodes.BASTORE && currentArray.type == Opcodes.T_BYTE) {
+                currentArray.write(recentInts.get(recentInts.size() - 2),
+                        recentInts.get(recentInts.size() - 1));
+            } else if (opcode == Opcodes.CASTORE && currentArray.type == Opcodes.T_CHAR) {
+                currentArray.write(recentInts.get(recentInts.size() - 2),
+                        recentInts.get(recentInts.size() - 1));
+            }
+        }
+
+        private void finishArray() {
+            if (currentArray != null) {
+                if (currentArray.written > 0) {
+                    arrays.add(currentArray);
+                }
+                currentArray = null;
+            }
+        }
+
+        private void handleStringBuilder(String owner, String name, String descriptor) {
+            if (!"java/lang/StringBuilder".equals(owner)) {
+                return;
+            }
+            if ("<init>".equals(name)) {
+                if (builder != null && "(Ljava/lang/String;)V".equals(descriptor)) {
+                    if (pendingString != null) {
+                        builder.value.append(pendingString);
+                    } else {
+                        builder.valid = false;
+                    }
+                }
+                return;
+            }
+            if (builder == null) {
+                return;
+            }
+
+            if ("append".equals(name)) {
+                if (descriptor.startsWith("(C)") || descriptor.startsWith("(I)")) {
+                    if (lastInt != null) {
+                        builder.value.append((char) lastInt.intValue());
+                    } else {
+                        builder.valid = false;
+                    }
+                } else if (descriptor.startsWith("(Ljava/lang/String;)")) {
+                    if (pendingString != null) {
+                        builder.value.append(pendingString);
+                    } else {
+                        builder.valid = false;
+                    }
+                } else {
+                    builder.valid = false;
+                }
+            } else if ("toString".equals(name)) {
+                captureBuilderString();
+                builder = null;
+            }
+        }
+
+        private void captureBuilderString() {
+            if (builder != null && builder.valid && builder.value.length() > 0) {
+                builderStrings.add(builder.value.toString());
+            }
+        }
+
+        private void addIfDangerous(List<String> target, String value) {
+            if (value == null || value.isEmpty() || value.length() > MAX_DECODED_STRING) {
+                return;
+            }
+            if (!SignatureRules.matching(value).isEmpty()) {
+                target.add(value);
+            }
+        }
+
+        private static boolean isStringFromBytes(String owner, String name, String descriptor) {
+            if (!"java/lang/String".equals(owner)) {
+                return false;
+            }
+            if ("<init>".equals(name) || "valueOf".equals(name)) {
+                return descriptor.startsWith("([B");
+            }
+            return "copyValueOf".equals(name) && descriptor.startsWith("([B");
+        }
+
+        private static boolean isStringFromChars(String owner, String name, String descriptor) {
+            if (!"java/lang/String".equals(owner)) {
+                return false;
+            }
+            if ("<init>".equals(name) || "valueOf".equals(name)) {
+                return descriptor.startsWith("([C");
+            }
+            return "copyValueOf".equals(name) && descriptor.startsWith("([C");
+        }
+
+        private static int ruleForCall(String owner, String name, String descriptor) {
+            if ("java/net/URLClassLoader".equals(owner)
+                    && ("<init>".equals(name)
+                    || "newInstance".equals(name)
+                    || "loadClass".equals(name))) {
+                return 12;
+            }
+            if ("defineClass".equals(name) && descriptor.contains("[B")) {
+                return 12;
+            }
+            if ("java/lang/Runtime".equals(owner) && "exec".equals(name)) {
+                return 13;
+            }
+            if ("java/lang/ProcessBuilder".equals(owner)
+                    && ("<init>".equals(name) || "start".equals(name))) {
+                return 13;
+            }
+            if ("java/net/URL".equals(owner) && "openConnection".equals(name)) {
+                return 14;
+            }
+            if ("java/net/Socket".equals(owner)
+                    || "javax/net/ssl/SSLSocket".equals(owner)) {
+                return 14;
+            }
+            if (owner.startsWith("java/net/http/HttpClient")) {
+                return 14;
+            }
+            return 0;
+        }
+    }
+
+    private static final class ArrayValue {
+        private final int type;
+        private int[] values;
+        private int written;
+
+        private ArrayValue(int type, int length) {
+            this.type = type;
+            this.values = new int[Math.min(length, MAX_DECODED_ARRAY)];
+        }
+
+        private void write(int index, int value) {
+            if (index < 0 || index >= MAX_DECODED_ARRAY) {
+                return;
+            }
+            if (index >= values.length) {
+                int newLength = Math.min(MAX_DECODED_ARRAY, Math.max(index + 1, values.length * 2));
+                int[] grown = new int[newLength];
+                System.arraycopy(values, 0, grown, 0, values.length);
+                values = grown;
+            }
+            values[index] = value;
+            written++;
+        }
+
+        private String decodeXor(int key) {
+            if (values.length == 0) {
+                return null;
+            }
+            byte[] bytes = new byte[values.length];
+            for (int i = 0; i < values.length; i++) {
+                bytes[i] = (byte) ((values[i] ^ key) & 0xFF);
+            }
+            return new String(bytes, StandardCharsets.UTF_8);
+        }
+
+        private String asChars() {
+            char[] chars = new char[values.length];
+            for (int i = 0; i < values.length; i++) {
+                chars[i] = (char) (values[i] & 0xFFFF);
+            }
+            return new String(chars);
+        }
+    }
+
+    private static final class StringBuilderCapture {
+        private final StringBuilder value = new StringBuilder();
+        private boolean valid = true;
+    }
+}
+
+record DangerousCall(
+        int rule,
+        String className,
+        String methodName,
+        String owner,
+        String calledName,
+        String descriptor
+) {
+}
+
+record DecodedCandidate(String value, String methodName, String technique) {
+}
+
+record XorLoop(String className, String methodName) {
+}
+
+record BytecodeAnalysis(
+        String className,
+        List<DangerousCall> dangerousCalls,
+        boolean dangerousInClinit,
+        List<DecodedCandidate> xorStrings,
+        List<DecodedCandidate> assembledStrings,
+        XorLoop xorLoop
+) {
+}
