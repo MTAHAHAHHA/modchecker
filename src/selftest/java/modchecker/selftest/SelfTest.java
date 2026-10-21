@@ -15,6 +15,7 @@ import modchecker.report.ModReport;
 import modchecker.report.ReportPrinter;
 import modchecker.scan.ModFinder;
 import modchecker.scan.ScanService;
+import modchecker.trust.TrustedHashes;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
@@ -315,6 +316,53 @@ public final class SelfTest {
             assertPointsAndRules(result, 0, Set.of());
         });
 
+        check("Сканер: .jar.sample читается как обычный jar", () -> {
+            Path sample = writeJar(tempDir, "webhook_sample.jar.sample", Map.of(
+                    "testmods/sample/SampleMod.class",
+                    classWithString("testmods/sample/SampleMod", HIDDEN_WEBHOOK)
+            ));
+
+            ModScanResult result = scanner.scan(sample);
+            assertPointsAndRules(result, 4, Set.of(1));
+            require(finding(result, 1).location().contains("SampleMod"),
+                    "в находке из .jar.sample нет класса SampleMod");
+        });
+
+        check("Доверенные хеши: вердикт ДОВЕРЕН (вручную) не скрывает находки", () -> {
+            Path jar = writeJar(tempDir, "trusted_suspicious.jar", Map.of(
+                    "testmods/trusted/Stealer.class",
+                    classWithString("testmods/trusted/Stealer",
+                            "discord.com/api/webhooks/1/test Local Storage")
+            ));
+
+            ModScanResult scan = scanner.scan(jar);
+            require(scan.points() >= ModScanResult.SUSPICIOUS_THRESHOLD,
+                    "для проверки доверия нужен файл с 10+ очками");
+            String sha1 = Hashes.sha1(jar);
+            Path trustedFile = TrustedHashes.fileNear(jar);
+            require(TrustedHashes.add(trustedFile, sha1, "ручной тест"),
+                    "хеш не добавился в trusted_hashes.txt");
+
+            var found = TrustedHashes.find(jar, sha1);
+            require(found.isPresent(), "хеш не найден в trusted_hashes.txt");
+            require(found.get().comment().equals("ручной тест"),
+                    "комментарий доверенного хеша не сохранился");
+
+            scan.markManuallyTrusted(
+                    found.get().source().toString(), found.get().comment());
+            require(scan.verdict() == Verdict.TRUSTED,
+                    "доверенный файл должен получать ДОВЕРЕН (вручную)");
+            require(!scan.findings().isEmpty(),
+                    "у доверенного файла должны остаться все находки");
+            require(scan.points() >= ModScanResult.SUSPICIOUS_THRESHOLD,
+                    "доверие не должно менять очки");
+
+            require(TrustedHashes.remove(trustedFile, sha1),
+                    "хеш не удалился из trusted_hashes.txt");
+            require(TrustedHashes.findInFile(trustedFile, sha1).isEmpty(),
+                    "удалённый хеш всё ещё находится");
+        });
+
         check("Сканер: discord_integration - вебхук и HttpClient", () -> {
             ModScanResult result = scanner.scan(modsDir.resolve("discord_integration.jar"));
             assertPointsAndRules(result, 6, Set.of(1, 14));
@@ -348,6 +396,8 @@ public final class SelfTest {
                     "в месте находки нет метода packed");
             require(link(result, "КРАЖА").evidence().contains("1 + 4"),
                     "связка должна сложиться из скрытого правила 1 и правила 4");
+            require(result.decodedNotes().isEmpty(),
+                    "опасная Base64-строка не должна попадать в заметки");
         });
 
         check("Сканер: xor_stealer - Telegram XOR, аккаунты и КРАЖА", () -> {
@@ -406,6 +456,118 @@ public final class SelfTest {
                     "правило 18 не должно участвовать в связке ЗАГРУЗЧИК");
         });
 
+        check("Сканер: hwid_collector - правила 22+23 = 5 очков", () -> {
+            Map<String, byte[]> entries = new LinkedHashMap<>();
+            entries.put("testmods/hwid/a.class",
+                    classWithHardwareCollector("testmods/hwid/a"));
+            for (int i = 0; i < 10; i++) {
+                String name = "Feature" + (char) ('A' + i);
+                entries.put("testmods/hwid/" + name + ".class",
+                        emptyClass("testmods/hwid/" + name));
+            }
+
+            Path jar = writeJar(tempDir, "hwid_collector.jar", entries);
+            ModScanResult result = scanner.scan(jar);
+            assertPointsRulesAndLinks(result, 5, Set.of(22, 23), Set.of());
+            require(result.verdict() == Verdict.UNKNOWN,
+                    "5 очков без сайта должны давать НЕИЗВЕСТНО");
+
+            require(finding(result, 22).location().contains("класс testmods.hwid.a"),
+                    "правило 22 не показало короткий класс a");
+            require(finding(result, 22).location().contains("метод collect"),
+                    "правило 22 не показало метод collect");
+            require(finding(result, 22).evidence().contains("getHardwareUUID"),
+                    "правило 22 не показало вызов getHardwareUUID");
+            require(finding(result, 23).location().contains("testmods.hwid.a"),
+                    "правило 23 не показало класс со спрятанным сбором");
+            require(finding(result, 23).evidence().contains("10 из 11"),
+                    "правило 23 не посчитало нормальные классы");
+        });
+
+        check("Сканер: правило 23 - O004 и Il1", () -> {
+            for (String shortName : List.of("O004", "Il1")) {
+                Map<String, byte[]> entries = new LinkedHashMap<>();
+                String className = "testmods/hwid/" + shortName;
+                entries.put(className + ".class",
+                        classWithHardwareCall(className,
+                                "oshi/hardware/ComputerSystem", "getHardwareUUID",
+                                "()Ljava/lang/String;", true));
+                for (int i = 0; i < 10; i++) {
+                    String normalName = "Feature" + (char) ('A' + i);
+                    entries.put("testmods/hwid/" + normalName + ".class",
+                            emptyClass("testmods/hwid/" + normalName));
+                }
+
+                Path jar = writeJar(tempDir, "hwid_" + shortName + ".jar", entries);
+                ModScanResult result = scanner.scan(jar);
+                assertPointsRulesAndLinks(result, 5, Set.of(22, 23), Set.of());
+            }
+        });
+
+        check("Сканер: правило 22 - OSHI, MAC и строки Windows", () -> {
+            record Call(String owner, String name, String descriptor,
+                        boolean isInterface) {
+            }
+
+            List<Call> calls = List.of(
+                    new Call("oshi/hardware/ComputerSystem", "getHardwareUUID",
+                            "()Ljava/lang/String;", true),
+                    new Call("oshi/hardware/Baseboard", "getSerialNumber",
+                            "()Ljava/lang/String;", true),
+                    new Call("oshi/hardware/HWDiskStore", "getSerial",
+                            "()Ljava/lang/String;", true),
+                    new Call("java/net/NetworkInterface", "getHardwareAddress",
+                            "()[B", false)
+            );
+
+            int index = 0;
+            for (Call call : calls) {
+                String className = "testmods/hwid/Call" + index;
+                Path jar = writeJar(tempDir, "hwid_call_" + index + ".jar", Map.of(
+                        className + ".class",
+                        classWithHardwareCall(className, call.owner(), call.name(),
+                                call.descriptor(), call.isInterface())
+                ));
+
+                ModScanResult result = scanner.scan(jar);
+                assertPointsAndRules(result, 3, Set.of(22));
+                require(!result.hasRule(23),
+                        "без короткого класса правило 23 не должно добавляться");
+                require(finding(result, 22).evidence().contains(call.name()),
+                        "в доказательстве нет " + call.name());
+                index++;
+            }
+
+            List<String> markers = List.of(
+                    "wmic csproduct get uuid",
+                    "csproduct",
+                    "wmic baseboard get serialnumber",
+                    "wmic diskdrive get serialnumber",
+                    "MachineGuid"
+            );
+            for (String marker : markers) {
+                String className = "testmods/hwid/String" + index;
+                Path jar = writeJar(tempDir, "hwid_string_" + index + ".jar", Map.of(
+                        className + ".class", classWithString(className, marker)
+                ));
+
+                ModScanResult result = scanner.scan(jar);
+                assertPointsAndRules(result, 3, Set.of(22));
+                require(!result.hasRule(23),
+                        "без короткого класса правило 23 не должно добавляться");
+                index++;
+            }
+
+            Path configJar = writeJar(tempDir, "hwid_config_words.jar", Map.of(
+                    "testmods/config/ServerConfig$DiskDrive.class",
+                    classWithString("testmods/config/ServerConfig$DiskDrive", "diskdrive"),
+                    "testmods/config/BaseboardConfig.class",
+                    classWithString("testmods/config/BaseboardConfig", "baseboard")
+            ));
+            ModScanResult configResult = scanner.scan(configJar);
+            assertPointsAndRules(configResult, 0, Set.of());
+        });
+
         check("Сканер: правило 9 берёт максимум из pastebin и вебхука", () -> {
             ModScanResult result = scanner.scan(extraDir.resolve("hidden_max_9.jar"));
             assertPointsAndRules(result, 7, Set.of(9));
@@ -439,6 +601,40 @@ public final class SelfTest {
                     "у правила 14 не показан метод connect");
             require(!result.hasRule(16),
                     "вне <clinit> правило 16 добавляться не должно");
+        });
+
+        check("Сканер: Runtime.exec рядом с explorer - 1 очко", () -> {
+            int index = 0;
+            for (String marker : List.of(
+                    "explorer", "xdg-open", "open", "rundll32 url.dll")) {
+                String className = "testmods/open/Open" + index;
+                Path jar = writeJar(tempDir, "open_command_" + index + ".jar", Map.of(
+                        className + ".class",
+                        classWithCallAndString(className,
+                                "java/lang/Runtime", "exec",
+                                "(Ljava/lang/String;)Ljava/lang/Process;",
+                                false, marker)
+                ));
+
+                ModScanResult result = scanner.scan(jar);
+                assertPointsAndRules(result, 1, Set.of(13));
+                require(finding(result, 13).evidence().contains("открытие"),
+                        "в доказательстве нет пометки об открытии папки/ссылки");
+                index++;
+            }
+        });
+
+        check("Сканер: Runtime.exec в open() и команда в соседнем методе - 1 очко", () -> {
+            String className = "testmods/open/OpenHelper";
+            Path jar = writeJar(tempDir, "open_helper.jar", Map.of(
+                    className + ".class",
+                    classWithOpenHelper(className, "xdg-open")
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 1, Set.of(13));
+            require(finding(result, 13).location().contains("метод open"),
+                    "правило 13 должно относиться к методу open");
         });
 
         check("Сканер: два опасных вызова в <clinit> дают 16 один раз", () -> {
@@ -517,6 +713,50 @@ public final class SelfTest {
             require(result.hasEvidenceRule(1), "Base64-вебхук не отмечен как вебхук");
             require(finding(result, 9).evidence().contains("Base64"),
                     "не указано, что строка была в Base64");
+        });
+
+        check("Сканер: Base64 обычного текста даёт заметку", () -> {
+            String plain = "ordinary text for manual review";
+            String encoded = Base64.getEncoder().encodeToString(
+                    plain.getBytes(StandardCharsets.UTF_8));
+            Path jar = writeJar(tempDir, "base64_note.jar", Map.of(
+                    "assets/note.txt", utf8(encoded)
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 0, Set.of());
+            require(result.decodedNotes().size() == 1,
+                    "ожидалась одна заметка, получено: " + result.decodedNotes());
+            require(result.decodedNotes().get(0).value().equals(plain),
+                    "раскрытый текст заметки не совпал");
+            require(result.decodedNotes().get(0).location().contains("assets/note.txt"),
+                    "в заметке нет места находки");
+
+            String report = ReportPrinter.format(List.of(new ModReport(result,
+                    new OnlineCheckResult("0".repeat(40),
+                            OnlineStatus.SKIPPED, OnlineStatus.SKIPPED))));
+            require(report.contains("Заметка: раскрытые строки"),
+                    "в отчёте нет заголовка заметки");
+            require(report.contains(plain),
+                    "в отчёте нет раскрытой строки");
+        });
+
+        check("Сканер: Base64 заметки ограничены 10", () -> {
+            StringBuilder content = new StringBuilder();
+            for (int i = 0; i < 11; i++) {
+                String plain = "ordinary note text number " + i;
+                content.append(Base64.getEncoder().encodeToString(
+                        plain.getBytes(StandardCharsets.UTF_8))).append('\n');
+            }
+            Path jar = writeJar(tempDir, "base64_notes_limit.jar", Map.of(
+                    "assets/notes.txt", utf8(content.toString())
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 0, Set.of());
+            require(result.decodedNotes().size() == 10,
+                    "заметок должно быть не больше 10, получено: "
+                            + result.decodedNotes().size());
         });
 
         check("Сканер: hex в текстовом файле", () -> {
@@ -929,17 +1169,26 @@ public final class SelfTest {
                     "неверный текст пустого ключа");
         });
 
-        check("Поиск модов: один jar и папка без подпапок", () -> {
+        check("Поиск модов: .jar и .jar.sample без подпапок", () -> {
             Path finderDir = Files.createDirectories(tempDir.resolve("finder"));
             Path one = Files.writeString(finderDir.resolve("one.jar"), "x");
+            Path sample = Files.writeString(finderDir.resolve("two.jar.sample"), "x");
             Files.writeString(finderDir.resolve("note.txt"), "x");
+            Files.writeString(finderDir.resolve("skip.jar.sample.txt"), "x");
             Path sub = Files.createDirectories(finderDir.resolve("sub"));
             Files.writeString(sub.resolve("two.jar"), "x");
 
-            require(ModFinder.find(finderDir).equals(List.of(one)),
-                    "папка должна давать только one.jar: " + ModFinder.find(finderDir));
+            require(ModFinder.find(finderDir).equals(List.of(one, sample)),
+                    "папка должна давать one.jar и two.jar.sample: "
+                            + ModFinder.find(finderDir));
             require(ModFinder.find(one).equals(List.of(one)),
                     "одиночный jar должен возвращаться как есть");
+            require(ModFinder.find(sample).equals(List.of(sample)),
+                    "одиночный .jar.sample должен возвращаться как есть");
+            require(ModFinder.isModFileName("MOD.JAR.SAMPLE"),
+                    "расширение .jar.sample должно быть регистронезависимым");
+            require(!ModFinder.isModFileName("mod.jar.sample.txt"),
+                    "файл с хвостом .txt не должен считаться образцом");
             require(ModFinder.find(Files.createDirectories(
                             tempDir.resolve("finder-empty"))).isEmpty(),
                     "пустая папка должна давать пустой список");
@@ -997,9 +1246,11 @@ public final class SelfTest {
         allRuleEntries.put("assets/config.json",
                 utf8("discord.com/api/webhooks\napi.telegram.org"));
         allRuleEntries.put("data/app.properties",
-                utf8("launcher_accounts\nLocal Storage\nCookies"));
+                utf8("launcher_accounts\nLocal Storage"));
         allRuleEntries.put("data/settings.cfg",
                 utf8("wallet.dat\ndev/neko\npastebin.com"));
+        allRuleEntries.put("testmods/rules/CookieClass.class",
+                classWithString("testmods/rules/CookieClass", "Cookies"));
         allRuleEntries.put("notes.txt",
                 utf8("discord.com/api/webhooks"));
         Path allRulesJar = writeJar(tempDir, "all_rules.jar", allRuleEntries);
@@ -1010,6 +1261,16 @@ public final class SelfTest {
                     Set.of(1, 2, 3, 4, 5, 6, 7, 8), Set.of("КРАЖА"));
             require(link(result, "КРАЖА").evidence().contains("1 + 3"),
                     "связка должна использовать первые подходящие правила 1 и 3");
+        });
+
+        check("Сканер: Cookies в .json не даёт правило 5", () -> {
+            Path jar = writeJar(tempDir, "cookies_json.jar", Map.of(
+                    "assets/refmap.json",
+                    utf8("{\"cookies\":\"minecraft:method\"}")
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 0, Set.of());
         });
 
         Path unknownExtension = writeJar(tempDir, "unknown_extension.jar", Map.of(
@@ -1059,6 +1320,65 @@ public final class SelfTest {
                             + finding(result, 17).location());
             require(!result.hasRule(6),
                     "файл третьего уровня не должен проверяться");
+        });
+
+        check("Сканер: вложенный .jar.sample", () -> {
+            byte[] inner = zipBytes(Map.of(
+                    "inside.txt", utf8(HIDDEN_WEBHOOK)
+            ));
+            Path outer = writeJar(tempDir, "nested_sample_holder.jar",
+                    Map.of("inner.jar.sample", inner));
+
+            ModScanResult result = scanner.scan(outer);
+            assertPointsAndRules(result, 4, Set.of(1));
+            require(finding(result, 1).location()
+                            .contains("inner.jar.sample!/inside.txt"),
+                    "не показан полный путь вложенного .jar.sample: "
+                            + finding(result, 1).location());
+        });
+
+        check("Связка: Telegram в основном коде и Local Storage во вложенном jar", () -> {
+            byte[] inner = zipBytes(Map.of(
+                    "data.txt", utf8("Local Storage")
+            ));
+            Path jar = writeJar(tempDir, "nested_link_isolation.jar", Map.of(
+                    "testmods/link/Main.class",
+                    classWithString("testmods/link/Main", "api.telegram.org"),
+                    "libs/kotlin-compiler.jar", inner
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 7, Set.of(2, 4));
+            require(result.links().isEmpty(),
+                    "нельзя складывать Telegram из основного кода с данными "
+                            + "из вложенного jar: " + result.links());
+        });
+
+        check("Связка: обе части в одном вложенном jar и места в отчёте", () -> {
+            byte[] inner = zipBytes(Map.of(
+                    "data.txt", utf8("api.telegram.org\nLocal Storage")
+            ));
+            Path jar = writeJar(tempDir, "nested_link_same.jar", Map.of(
+                    "libs/kotlin-compiler.jar", inner
+            ));
+
+            ModScanResult result = scanner.scan(jar);
+            assertPointsRulesAndLinks(result, 11, Set.of(2, 4), Set.of("КРАЖА"));
+            LinkFinding theft = link(result, "КРАЖА");
+            require(theft.firstLocation().contains("kotlin-compiler.jar!/data.txt"),
+                    "в связке не показано место первой части: "
+                            + theft.firstLocation());
+            require(theft.secondLocation().contains("kotlin-compiler.jar!/data.txt"),
+                    "в связке не показано место второй части: "
+                            + theft.secondLocation());
+
+            String report = ReportPrinter.format(List.of(new ModReport(result,
+                    new OnlineCheckResult("0".repeat(40),
+                            OnlineStatus.SKIPPED, OnlineStatus.SKIPPED))));
+            require(report.contains("часть 1:")
+                            && report.contains("часть 2:")
+                            && report.contains("kotlin-compiler.jar"),
+                    "в отчёте не показаны места обеих частей связки");
         });
     }
 
@@ -1157,6 +1477,132 @@ public final class SelfTest {
         method.visitMaxs(1, 0);
         method.visitEnd();
 
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] classWithCallAndString(String className, String owner,
+                                                 String calledName, String descriptor,
+                                                 boolean isInterface, String value) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        MethodVisitor method = writer.visitMethod(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "run", "()V", null, null);
+        method.visitCode();
+        method.visitLdcInsn(value);
+        method.visitInsn(Opcodes.POP);
+        method.visitInsn(Opcodes.ACONST_NULL);
+        method.visitMethodInsn(
+                isInterface ? Opcodes.INVOKEINTERFACE : Opcodes.INVOKEVIRTUAL,
+                owner, calledName, descriptor, isInterface);
+        method.visitInsn(Opcodes.POP);
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(1, 0);
+        method.visitEnd();
+
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    /**
+     * Runtime.exec в open(), а команда открытия - в соседнем методе класса.
+     * Так устроен, например, meteordevelopment.meteorclient.Main$OperatingSystem.
+     */
+    private static byte[] classWithOpenHelper(String className, String command) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        MethodVisitor helper = writer.visitMethod(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
+                "getURLOpenCommand", "()[Ljava/lang/String;", null, null);
+        helper.visitCode();
+        helper.visitInsn(Opcodes.ICONST_1);
+        helper.visitTypeInsn(Opcodes.ANEWARRAY, "java/lang/String");
+        helper.visitInsn(Opcodes.DUP);
+        helper.visitInsn(Opcodes.ICONST_0);
+        helper.visitLdcInsn(command);
+        helper.visitInsn(Opcodes.AASTORE);
+        helper.visitInsn(Opcodes.ARETURN);
+        helper.visitMaxs(4, 0);
+        helper.visitEnd();
+
+        MethodVisitor open = writer.visitMethod(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "open", "()V", null, null);
+        open.visitCode();
+        open.visitInsn(Opcodes.ACONST_NULL);
+        open.visitMethodInsn(Opcodes.INVOKESTATIC, className,
+                "getURLOpenCommand", "()[Ljava/lang/String;", false);
+        open.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Runtime",
+                "exec", "([Ljava/lang/String;)Ljava/lang/Process;", false);
+        open.visitInsn(Opcodes.POP);
+        open.visitInsn(Opcodes.RETURN);
+        open.visitMaxs(2, 0);
+        open.visitEnd();
+
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] classWithHardwareCollector(String className) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        MethodVisitor method = writer.visitMethod(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "collect", "()V", null, null);
+        method.visitCode();
+        method.visitInsn(Opcodes.ACONST_NULL);
+        method.visitMethodInsn(Opcodes.INVOKEINTERFACE,
+                "oshi/hardware/ComputerSystem", "getHardwareUUID",
+                "()Ljava/lang/String;", true);
+        method.visitInsn(Opcodes.POP);
+        method.visitInsn(Opcodes.ACONST_NULL);
+        method.visitMethodInsn(Opcodes.INVOKEVIRTUAL,
+                "java/net/NetworkInterface", "getHardwareAddress",
+                "()[B", false);
+        method.visitInsn(Opcodes.POP);
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(1, 0);
+        method.visitEnd();
+
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] classWithHardwareCall(String className, String owner,
+                                                String calledName, String descriptor,
+                                                boolean isInterface) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        MethodVisitor method = writer.visitMethod(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "collect", "()V", null, null);
+        method.visitCode();
+        method.visitInsn(Opcodes.ACONST_NULL);
+        method.visitMethodInsn(
+                isInterface ? Opcodes.INVOKEINTERFACE : Opcodes.INVOKEVIRTUAL,
+                owner, calledName, descriptor, isInterface);
+        method.visitInsn(Opcodes.POP);
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(1, 0);
+        method.visitEnd();
+
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] emptyClass(String className) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
         writer.visitEnd();
         return writer.toByteArray();
     }

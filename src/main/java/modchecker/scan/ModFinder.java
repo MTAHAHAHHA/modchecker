@@ -6,6 +6,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Общий поиск модов для консольного и графического режимов.
@@ -16,8 +17,16 @@ public final class ModFinder {
     }
 
     /**
+     * Обычный мод или образец, который нельзя запустить двойным кликом.
+     */
+    public static boolean isModFileName(String fileName) {
+        String lowerName = fileName.toLowerCase(Locale.ROOT);
+        return lowerName.endsWith(".jar") || lowerName.endsWith(".jar.sample");
+    }
+
+    /**
      * Если передан файл - возвращаем его. Если папка - ищем в ней .jar
-     * без захода в подпапки.
+     * и .jar.sample без захода в подпапки.
      */
     public static List<Path> find(Path target) throws IOException {
         if (!Files.exists(target)) {
@@ -33,8 +42,7 @@ public final class ModFinder {
         List<Path> result = new ArrayList<>();
         try (var stream = Files.list(target)) {
             stream.filter(Files::isRegularFile)
-                    .filter(path -> path.getFileName().toString()
-                            .toLowerCase(java.util.Locale.ROOT).endsWith(".jar"))
+                    .filter(path -> isModFileName(path.getFileName().toString()))
                     .sorted(Comparator.comparing(path -> path.getFileName().toString()))
                     .forEach(result::add);
         }

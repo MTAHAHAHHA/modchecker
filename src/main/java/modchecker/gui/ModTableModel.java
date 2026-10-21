@@ -97,8 +97,9 @@ public final class ModTableModel extends AbstractTableModel {
         return switch (label) {
             case "ПОДОЗРИТЕЛЬНО" -> 0;
             case "НЕИЗВЕСТНО" -> 1;
-            case "ОК" -> 2;
-            case "ОШИБКА" -> 3;
+            case "ДОВЕРЕН (вручную)" -> 2;
+            case "ОК" -> 3;
+            case "ОШИБКА" -> 4;
             default -> 99;
         };
     }

@@ -8,6 +8,7 @@ import modchecker.online.OnlineChecker;
 import modchecker.report.ModReport;
 import modchecker.report.ReportPrinter;
 import modchecker.scan.ModFinder;
+import modchecker.trust.TrustedHashes;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
@@ -27,6 +28,7 @@ import javax.swing.JTextField;
 import javax.swing.JToggleButton;
 import javax.swing.ListSelectionModel;
 import javax.swing.SwingWorker;
+import javax.swing.filechooser.FileFilter;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.table.TableCellRenderer;
 import java.awt.BorderLayout;
@@ -61,15 +63,18 @@ public final class ModCheckerFrame extends JFrame {
 
     private static final Color SUSPICIOUS_BACKGROUND = new Color(255, 225, 225);
     private static final Color UNKNOWN_BACKGROUND = new Color(255, 248, 195);
+    private static final Color TRUSTED_BACKGROUND = new Color(220, 235, 255);
     private static final Color OK_BACKGROUND = new Color(225, 245, 225);
     private static final Color ERROR_BACKGROUND = new Color(230, 230, 230);
 
     private final ModTableModel tableModel = new ModTableModel();
     private final JTextField pathField = new JTextField();
     private final JButton folderButton = new JButton("Папка...");
-    private final JButton jarButton = new JButton("Файл .jar...");
+    private final JButton jarButton = new JButton("Файл .jar/.sample...");
     private final JButton scanButton = new JButton("Проверить");
     private final JButton saveButton = new JButton("Сохранить отчёт");
+    private final JButton trustButton = new JButton("Доверять этому файлу");
+    private final JButton untrustButton = new JButton("Убрать из доверенных");
     private final JProgressBar progressBar = new JProgressBar();
     private final JTable table = new JTable(tableModel) {
         @Override
@@ -156,7 +161,7 @@ public final class ModCheckerFrame extends JFrame {
         panel.setBorder(BorderFactory.createEmptyBorder(0, 0, 4, 0));
         panel.add(new JLabel("Путь:"), BorderLayout.WEST);
 
-        pathField.setToolTipText("Папка с модами или один .jar");
+        pathField.setToolTipText("Папка с модами, один .jar или .jar.sample");
         panel.add(pathField, BorderLayout.CENTER);
 
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
@@ -241,7 +246,23 @@ public final class ModCheckerFrame extends JFrame {
         hint.setFont(hint.getFont().deriveFont(Font.PLAIN, 11f));
         hint.setForeground(new Color(90, 90, 90));
         hint.setBorder(BorderFactory.createEmptyBorder(3, 2, 3, 2));
-        tablePanel.add(hint, BorderLayout.SOUTH);
+
+        trustButton.setEnabled(false);
+        trustButton.setToolTipText("Добавить SHA-1 в "
+                + TrustedHashes.defaultFile());
+        trustButton.addActionListener(event -> trustSelected());
+        untrustButton.setEnabled(false);
+        untrustButton.setToolTipText("Убрать SHA-1 из доверенных файлов");
+        untrustButton.addActionListener(event -> untrustSelected());
+
+        JPanel trustButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        trustButtons.add(trustButton);
+        trustButtons.add(untrustButton);
+
+        JPanel tableBottom = new JPanel(new BorderLayout());
+        tableBottom.add(hint, BorderLayout.WEST);
+        tableBottom.add(trustButtons, BorderLayout.EAST);
+        tablePanel.add(tableBottom, BorderLayout.SOUTH);
 
         detailsArea.setEditable(false);
         detailsArea.setLineWrap(true);
@@ -330,9 +351,19 @@ public final class ModCheckerFrame extends JFrame {
 
     private void chooseJar() {
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Выберите .jar");
+        chooser.setDialogTitle("Выберите .jar или .jar.sample");
         chooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
-        chooser.setFileFilter(new FileNameExtensionFilter("Jar-файлы (*.jar)", "jar"));
+        chooser.setFileFilter(new FileFilter() {
+            @Override
+            public boolean accept(File file) {
+                return file.isDirectory() || ModFinder.isModFileName(file.getName());
+            }
+
+            @Override
+            public String getDescription() {
+                return "Jar-файлы (*.jar, *.jar.sample)";
+            }
+        });
         File current = currentDirectory();
         if (current != null) {
             chooser.setCurrentDirectory(current);
@@ -368,7 +399,7 @@ public final class ModCheckerFrame extends JFrame {
 
         String rawPath = pathField.getText().trim();
         if (rawPath.isEmpty()) {
-            showError("Укажите путь к папке с модами или к .jar.");
+            showError("Укажите путь к папке с модами, .jar или .jar.sample.");
             return;
         }
 
@@ -385,8 +416,8 @@ public final class ModCheckerFrame extends JFrame {
             return;
         }
         if (Files.isRegularFile(target)
-                && !target.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar")) {
-            showError("Выберите именно .jar файл.");
+                && !ModFinder.isModFileName(target.getFileName().toString())) {
+            showError("Выберите .jar или .jar.sample файл.");
             return;
         }
 
@@ -398,7 +429,7 @@ public final class ModCheckerFrame extends JFrame {
             return;
         }
         if (mods.isEmpty()) {
-            showError("Jar-файлы не найдены.");
+            showError("Jar-файлы (.jar, .jar.sample) не найдены.");
             return;
         }
 
@@ -411,6 +442,7 @@ public final class ModCheckerFrame extends JFrame {
         tableModel.setReports(List.of());
         detailsArea.setText("");
         updateTotals();
+        updateTrustButtons();
         scanning = true;
         scanButton.setEnabled(false);
         saveButton.setEnabled(false);
@@ -462,6 +494,7 @@ public final class ModCheckerFrame extends JFrame {
                 reports.clear();
                 reports.addAll(all);
                 updateTotals();
+                updateTrustButtons();
 
                 progressBar.setMaximum(Math.max(1, all.size()));
                 progressBar.setValue(all.size());
@@ -490,6 +523,7 @@ public final class ModCheckerFrame extends JFrame {
         int viewRow = table.getSelectedRow();
         if (viewRow < 0) {
             detailsArea.setText("");
+            updateTrustButtons();
             return;
         }
 
@@ -497,11 +531,119 @@ public final class ModCheckerFrame extends JFrame {
         ModReport report = tableModel.reportAt(modelRow);
         detailsArea.setText(ReportPrinter.formatMod(report).stripLeading());
         detailsArea.setCaretPosition(0);
+        updateTrustButtons();
+    }
+
+    private void trustSelected() {
+        ModReport report = selectedReport();
+        if (report == null) {
+            showError("Сначала выберите строку с модом.");
+            return;
+        }
+
+        String sha1 = report.online().sha1();
+        if (sha1 == null || sha1.isBlank()) {
+            showError("Не удалось вычислить SHA-1 этого файла.");
+            return;
+        }
+
+        int answer = JOptionPane.showConfirmDialog(
+                this,
+                "Доверять файлу " + report.scan().name() + "?\n\n"
+                        + "SHA-1: " + sha1 + "\n\n"
+                        + "Все находки останутся в отчёте, очки не изменятся.",
+                "Подтверждение доверия",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.QUESTION_MESSAGE
+        );
+        if (answer != JOptionPane.YES_OPTION) {
+            return;
+        }
+
+        try {
+            Path file = TrustedHashes.defaultFile();
+            boolean added = TrustedHashes.add(
+                    file, sha1, report.scan().name());
+            report.scan().markManuallyTrusted(
+                    file.toAbsolutePath().normalize().toString(),
+                    report.scan().name());
+            refreshAfterTrustChange(report.scan().file());
+            statusLabel.setText(added
+                    ? "файл добавлен в доверенные"
+                    : "файл уже был в доверенных");
+        } catch (IOException e) {
+            showError("Не удалось сохранить trusted_hashes.txt: " + e.getMessage());
+        }
+    }
+
+    private void untrustSelected() {
+        ModReport report = selectedReport();
+        if (report == null) {
+            showError("Сначала выберите строку с модом.");
+            return;
+        }
+
+        String sha1 = report.online().sha1();
+        if (sha1 == null || sha1.isBlank()) {
+            showError("Не удалось вычислить SHA-1 этого файла.");
+            return;
+        }
+
+        try {
+            int removed = TrustedHashes.removeEverywhere(
+                    report.scan().file(), sha1);
+            report.scan().clearManualTrust();
+            refreshAfterTrustChange(report.scan().file());
+            statusLabel.setText(removed > 0
+                    ? "файл убран из доверенных"
+                    : "хеш не найден в trusted_hashes.txt");
+        } catch (IOException e) {
+            showError("Не удалось изменить trusted_hashes.txt: " + e.getMessage());
+        }
+    }
+
+    private void refreshAfterTrustChange(Path selectedFile) {
+        tableModel.setReports(reports);
+        for (int viewRow = 0; viewRow < table.getRowCount(); viewRow++) {
+            int modelRow = table.convertRowIndexToModel(viewRow);
+            if (tableModel.reportAt(modelRow).scan().file().equals(selectedFile)) {
+                table.setRowSelectionInterval(viewRow, viewRow);
+                break;
+            }
+        }
+        updateTotals();
+        updateTrustButtons();
+        showDetails();
+    }
+
+    private ModReport selectedReport() {
+        int viewRow = table.getSelectedRow();
+        if (viewRow < 0) {
+            return null;
+        }
+        int modelRow = table.convertRowIndexToModel(viewRow);
+        return tableModel.reportAt(modelRow);
+    }
+
+    private void updateTrustButtons() {
+        ModReport report = selectedReport();
+        if (report == null) {
+            trustButton.setEnabled(false);
+            untrustButton.setEnabled(false);
+            return;
+        }
+
+        String sha1 = report.online().sha1();
+        boolean hasSha1 = sha1 != null && !sha1.isBlank();
+        boolean trusted = report.scan().isManuallyTrusted();
+        trustButton.setEnabled(hasSha1 && !trusted && !report.scan().hasError());
+        untrustButton.setEnabled(hasSha1 && trusted);
     }
 
     private void updateTotals() {
         int suspicious = 0;
         int unknown = 0;
+        int trusted = 0;
         int ok = 0;
         int errors = 0;
 
@@ -511,6 +653,8 @@ public final class ModCheckerFrame extends JFrame {
                 suspicious++;
             } else if (verdict == Verdict.UNKNOWN) {
                 unknown++;
+            } else if (verdict == Verdict.TRUSTED) {
+                trusted++;
             } else if (verdict == Verdict.OK) {
                 ok++;
             } else {
@@ -519,6 +663,7 @@ public final class ModCheckerFrame extends JFrame {
         }
 
         totalsLabel.setText("ОК: " + ok
+                + "   ДОВЕРЕН: " + trusted
                 + "   НЕИЗВЕСТНО: " + unknown
                 + "   ПОДОЗРИТЕЛЬНО: " + suspicious
                 + "   ОШИБКА: " + errors);
@@ -651,15 +796,14 @@ public final class ModCheckerFrame extends JFrame {
 
             if (files.size() != 1) {
                 event.dropComplete(false);
-                showError("Перетащите одну папку или один .jar.");
+                showError("Перетащите одну папку, .jar или .jar.sample.");
                 return;
             }
 
             File file = files.get(0);
-            if (!file.isDirectory()
-                    && !file.getName().toLowerCase(Locale.ROOT).endsWith(".jar")) {
+            if (!file.isDirectory() && !ModFinder.isModFileName(file.getName())) {
                 event.dropComplete(false);
-                showError("Нужна папка с модами или .jar.");
+                showError("Нужна папка с модами, .jar или .jar.sample.");
                 return;
             }
 
@@ -690,6 +834,7 @@ public final class ModCheckerFrame extends JFrame {
         return switch (verdict) {
             case SUSPICIOUS -> SUSPICIOUS_BACKGROUND;
             case UNKNOWN -> UNKNOWN_BACKGROUND;
+            case TRUSTED -> TRUSTED_BACKGROUND;
             case OK -> OK_BACKGROUND;
             case ERROR -> ERROR_BACKGROUND;
         };

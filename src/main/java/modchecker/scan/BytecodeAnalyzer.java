@@ -13,6 +13,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -53,6 +54,7 @@ final class BytecodeAnalyzer {
 
         String name = className[0];
         List<DangerousCall> calls = new ArrayList<>();
+        List<HardwareCall> hardwareCalls = new ArrayList<>();
         boolean dangerousInClinit = false;
         List<DecodedCandidate> xorStrings = new ArrayList<>();
         List<DecodedCandidate> assembledStrings = new ArrayList<>();
@@ -62,6 +64,7 @@ final class BytecodeAnalyzer {
             method.finish();
 
             calls.addAll(method.calls());
+            hardwareCalls.addAll(method.hardwareCalls());
             if ("<clinit>".equals(method.methodName()) && !method.calls().isEmpty()) {
                 dangerousInClinit = true;
             }
@@ -78,9 +81,12 @@ final class BytecodeAnalyzer {
             }
         }
 
+        markClassLevelOpenCommands(methods, calls);
+
         return new BytecodeAnalysis(
                 name,
                 List.copyOf(calls),
+                List.copyOf(hardwareCalls),
                 dangerousInClinit,
                 List.copyOf(deduplicate(xorStrings)),
                 List.copyOf(deduplicate(assembledStrings)),
@@ -96,11 +102,53 @@ final class BytecodeAnalyzer {
         return List.copyOf(unique.values());
     }
 
+    /**
+     * Некоторые моды выносят команду открытия в соседний метод
+     * (например, getURLOpenCommand), а Runtime.exec вызывают из open().
+     * Если в классе есть такая команда, а сам вызов находится в методе open*,
+     * считаем это открытием папки или ссылки.
+     */
+    private static void markClassLevelOpenCommands(List<MethodAnalyzer> methods,
+                                                   List<DangerousCall> calls) {
+        boolean classHasOpenCommand = methods.stream()
+                .anyMatch(MethodAnalyzer::hasOpenCommandString);
+        if (!classHasOpenCommand) {
+            return;
+        }
+
+        for (int i = 0; i < calls.size(); i++) {
+            DangerousCall call = calls.get(i);
+            if (call.rule() == 13
+                    && !call.openCommandContext()
+                    && isOpenMethodName(call.methodName())) {
+                calls.set(i, withOpenCommandContext(call));
+            }
+        }
+    }
+
+    private static boolean isOpenMethodName(String methodName) {
+        String lower = methodName.toLowerCase(Locale.ROOT);
+        return lower.equals("open") || lower.startsWith("open");
+    }
+
+    private static DangerousCall withOpenCommandContext(DangerousCall call) {
+        return new DangerousCall(
+                call.rule(),
+                call.className(),
+                call.methodName(),
+                call.owner(),
+                call.calledName(),
+                call.descriptor(),
+                true
+        );
+    }
+
     private static final class MethodAnalyzer extends MethodVisitor {
 
         private final String className;
         private final String methodName;
         private final List<DangerousCall> calls = new ArrayList<>();
+        private final List<HardwareCall> hardwareCalls = new ArrayList<>();
         private final List<ArrayValue> arrays = new ArrayList<>();
         private final List<Integer> recentInts = new ArrayList<>();
         private final Set<Label> visitedLabels = new HashSet<>();
@@ -115,6 +163,9 @@ final class BytecodeAnalyzer {
         private boolean hasStringFromBytes;
         private boolean hasStringFromChars;
         private boolean hasXor;
+        private boolean hasOpenCommandString;
+        private boolean hasRundll32;
+        private boolean hasUrlDll;
         private boolean backwardJump;
         private boolean finished;
         private final List<String> xorStrings = new ArrayList<>();
@@ -130,12 +181,20 @@ final class BytecodeAnalyzer {
             return calls;
         }
 
+        List<HardwareCall> hardwareCalls() {
+            return hardwareCalls;
+        }
+
         String methodName() {
             return methodName;
         }
 
         boolean hasXorLoop() {
             return hasXor && backwardJump && hasByteArray;
+        }
+
+        boolean hasOpenCommandString() {
+            return hasOpenCommandString;
         }
 
         List<String> xorStrings() {
@@ -227,7 +286,10 @@ final class BytecodeAnalyzer {
             int rule = ruleForCall(owner, name, descriptor);
             if (rule != 0) {
                 calls.add(new DangerousCall(
-                        rule, className, methodName, owner, name, descriptor));
+                        rule, className, methodName, owner, name, descriptor, false));
+            }
+            if (isHardwareCall(owner, name)) {
+                hardwareCalls.add(new HardwareCall(className, methodName, owner, name));
             }
 
             if (isStringFromBytes(owner, name, descriptor)) {
@@ -274,6 +336,17 @@ final class BytecodeAnalyzer {
             } else if (value instanceof String string) {
                 pendingString = string;
                 lastInt = null;
+                String lower = string.strip().toLowerCase(Locale.ROOT);
+                if (lower.contains("rundll32")) {
+                    hasRundll32 = true;
+                }
+                if (lower.contains("url.dll")) {
+                    hasUrlDll = true;
+                }
+                if (isOpenCommandString(string)
+                        || (hasRundll32 && hasUrlDll)) {
+                    hasOpenCommandString = true;
+                }
             } else {
                 clearPending();
             }
@@ -359,6 +432,24 @@ final class BytecodeAnalyzer {
             }
             for (String value : assembled) {
                 addIfDangerous(assembledStrings, value);
+            }
+
+            markOpenCommandCalls();
+        }
+
+        /**
+         * Runtime.exec/ProcessBuilder рядом с командой открытия папки или
+         * ссылки - это обычно штатное действие, а не запуск полезной нагрузки.
+         */
+        private void markOpenCommandCalls() {
+            if (!hasOpenCommandString) {
+                return;
+            }
+            for (int i = 0; i < calls.size(); i++) {
+                DangerousCall call = calls.get(i);
+                if (call.rule() == 13 && !call.openCommandContext()) {
+                    calls.set(i, withOpenCommandContext(call));
+                }
             }
         }
 
@@ -464,6 +555,33 @@ final class BytecodeAnalyzer {
             if (!SignatureRules.matching(value).isEmpty()) {
                 target.add(value);
             }
+        }
+
+        /**
+         * Правило 22: OSHI и MAC-адрес. Это отдельный список, чтобы сбор HWID
+         * не включал правило 16 "опасный вызов в статическом блоке".
+         */
+        private static boolean isHardwareCall(String owner, String name) {
+            if ("java/net/NetworkInterface".equals(owner)) {
+                return "getHardwareAddress".equals(name);
+            }
+            boolean oshi = owner.startsWith("oshi/") || owner.contains("/oshi/");
+            return oshi && ("getHardwareUUID".equals(name)
+                    || "getSerialNumber".equals(name)
+                    || "getSerial".equals(name));
+        }
+
+        /**
+         * Строки, которыми обычно открывают папку или ссылку в проводнике.
+         * "open" проверяем отдельно, чтобы не поймать слово в длинном тексте.
+         */
+        private static boolean isOpenCommandString(String value) {
+            String lower = value.strip().toLowerCase(Locale.ROOT);
+            return lower.contains("explorer")
+                    || lower.contains("xdg-open")
+                    || lower.equals("open")
+                    || lower.startsWith("open ")
+                    || lower.contains("rundll32 url.dll");
         }
 
         private static boolean isStringFromBytes(String owner, String name, String descriptor) {
@@ -573,7 +691,16 @@ record DangerousCall(
         String methodName,
         String owner,
         String calledName,
-        String descriptor
+        String descriptor,
+        boolean openCommandContext
+) {
+}
+
+record HardwareCall(
+        String className,
+        String methodName,
+        String owner,
+        String calledName
 ) {
 }
 
@@ -586,6 +713,7 @@ record XorLoop(String className, String methodName) {
 record BytecodeAnalysis(
         String className,
         List<DangerousCall> dangerousCalls,
+        List<HardwareCall> hardwareCalls,
         boolean dangerousInClinit,
         List<DecodedCandidate> xorStrings,
         List<DecodedCandidate> assembledStrings,

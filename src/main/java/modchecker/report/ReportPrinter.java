@@ -1,5 +1,6 @@
 package modchecker.report;
 
+import modchecker.model.DecodedNote;
 import modchecker.model.Finding;
 import modchecker.model.LinkFinding;
 import modchecker.model.ModScanResult;
@@ -65,6 +66,9 @@ public final class ReportPrinter {
         out.println("Очки: " + scan.points()
                 + " (находки " + scan.findingPoints()
                 + " + связки " + scan.linkPoints() + ")");
+        if (scan.isManuallyTrusted()) {
+            out.println("Доверие: вручную - " + scan.trustSource());
+        }
         out.println("SHA-1: " + online.sha1OrUnknown());
         out.println("Modrinth: " + online.modrinth().label());
         out.println("CurseForge: " + online.curseForge().label());
@@ -96,8 +100,18 @@ public final class ReportPrinter {
             out.println("Связки:");
             for (LinkFinding link : scan.links()) {
                 out.println("  " + link.name() + ": +" + link.points());
-                out.println("      место: " + link.location());
+                out.println("      " + link.location());
+                out.println("      часть 1: " + link.firstLocation());
+                out.println("      часть 2: " + link.secondLocation());
                 out.println("      " + link.evidence());
+            }
+        }
+
+        if (!scan.decodedNotes().isEmpty()) {
+            out.println("Заметка: раскрытые строки");
+            for (DecodedNote note : scan.decodedNotes()) {
+                out.println("  " + note.value());
+                out.println("      место: " + note.location());
             }
         }
     }
@@ -105,6 +119,7 @@ public final class ReportPrinter {
     private static void printTotals(List<ModReport> reports, PrintStream out) {
         int suspicious = 0;
         int unknown = 0;
+        int trusted = 0;
         int ok = 0;
         int errors = 0;
         int findings = 0;
@@ -118,6 +133,8 @@ public final class ReportPrinter {
                 suspicious++;
             } else if (verdict == Verdict.UNKNOWN) {
                 unknown++;
+            } else if (verdict == Verdict.TRUSTED) {
+                trusted++;
             } else if (verdict == Verdict.OK) {
                 ok++;
             } else {
@@ -134,6 +151,7 @@ public final class ReportPrinter {
         out.println("Проверено модов: " + reports.size());
         out.println("ПОДОЗРИТЕЛЬНО: " + suspicious);
         out.println("НЕИЗВЕСТНО: " + unknown);
+        out.println("ДОВЕРЕН (вручную): " + trusted);
         out.println("ОК: " + ok);
         out.println("ОШИБКА: " + errors);
         out.println("Находок: " + findings);
