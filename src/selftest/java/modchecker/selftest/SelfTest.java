@@ -1247,16 +1247,17 @@ public final class SelfTest {
         allRuleEntries.put("assets/config.json",
                 utf8("discord.com/api/webhooks\napi.telegram.org"));
         allRuleEntries.put("data/app.properties",
-                utf8("launcher_accounts\nLocal Storage"));
+                utf8("launcher_accounts"));
         allRuleEntries.put("data/settings.cfg",
                 utf8("wallet.dat\ndev/neko\npastebin.com"));
-        allRuleEntries.put("testmods/rules/CookieClass.class",
-                classWithString("testmods/rules/CookieClass", "Cookies"));
+        allRuleEntries.put("testmods/rules/BrowserClass.class",
+                classWithStrings("testmods/rules/BrowserClass",
+                        "Cookies", "Local Storage"));
         allRuleEntries.put("notes.txt",
                 utf8("discord.com/api/webhooks"));
         Path allRulesJar = writeJar(tempDir, "all_rules.jar", allRuleEntries);
 
-        check("Сканер: правила 1-8 и связка КРАЖА в текстовых файлах", () -> {
+        check("Сканер: правила 1-8 и связка КРАЖА", () -> {
             ModScanResult result = scanner.scan(allRulesJar);
             assertPointsRulesAndLinks(result, 33,
                     Set.of(1, 2, 3, 4, 5, 6, 7, 8), Set.of("КРАЖА"));
@@ -1272,6 +1273,58 @@ public final class SelfTest {
 
             ModScanResult result = scanner.scan(jar);
             assertPointsAndRules(result, 0, Set.of());
+        });
+
+        check("Сканер: правило 4 - Local Storage только в .class", () -> {
+            Path textJar = writeJar(tempDir, "browser_text.jar", Map.of(
+                    "assets/fancymenu/lang/en_us.json",
+                    utf8("{\"menu.local_storage\":\"Local Storage\"}"),
+                    "data/browser.properties", utf8("browser=leveldb"),
+                    "data/encoded.txt", utf8(Base64.getEncoder().encodeToString(
+                            "Local Storage".getBytes(StandardCharsets.UTF_8))),
+                    "notes.txt", utf8("Login Data")
+            ));
+
+            ModScanResult textResult = scanner.scan(textJar);
+            assertPointsAndRules(textResult, 0, Set.of());
+            require(!textResult.hasRule(4),
+                    "правило 4 не должно срабатывать на .json/.properties/.txt");
+
+            Path classJar = writeJar(tempDir, "browser_class.jar", Map.of(
+                    "testmods/browser/BrowserData.class",
+                    classWithString("testmods/browser/BrowserData", "Local Storage")
+            ));
+            assertPointsAndRules(scanner.scan(classJar), 4, Set.of(4));
+        });
+
+        check("Сканер: все сигнатуры браузера и кодировки только в .class", () -> {
+            for (String signature : List.of("local storage", "leveldb", "login data")) {
+                String base64 = Base64.getEncoder().encodeToString(utf8(signature));
+                String hex = java.util.HexFormat.of().formatHex(utf8(signature));
+                String reversed = new StringBuilder(signature).reverse().toString();
+                Path textJar = writeJar(tempDir, "browser_encodings_text.jar", Map.of(
+                        "assets/fancymenu/lang/en_us.json", utf8(signature),
+                        "data/browser.cfg", utf8(base64 + "\n" + hex + "\n" + reversed)
+                ));
+                ModScanResult textResult = scanner.scan(textJar);
+                assertPointsAndRules(textResult, 0, Set.of());
+                require(!textResult.hasEvidenceRule(4),
+                        "ресурсы не должны давать улику правила 4: " + signature);
+
+                Path plainJar = writeJar(tempDir, "browser_signature_class.jar", Map.of(
+                        "testmods/browser/BrowserData.class",
+                        classWithString("testmods/browser/BrowserData", signature)
+                ));
+                assertPointsAndRules(scanner.scan(plainJar), 4, Set.of(4));
+                Path encodedJar = writeJar(tempDir, "browser_encodings_class.jar", Map.of(
+                        "testmods/browser/BrowserData.class",
+                        classWithStrings("testmods/browser/BrowserData", hex, reversed)
+                ));
+                ModScanResult encodedResult = scanner.scan(encodedJar);
+                assertPointsAndRules(encodedResult, 7, Set.of(9));
+                require(encodedResult.hasEvidenceRule(4),
+                        "скрытая сигнатура в .class должна сохранять улику: " + signature);
+            }
         });
 
         Path unknownExtension = writeJar(tempDir, "unknown_extension.jar", Map.of(
@@ -1340,7 +1393,8 @@ public final class SelfTest {
 
         check("Связка: Telegram в основном коде и Local Storage во вложенном jar", () -> {
             byte[] inner = zipBytes(Map.of(
-                    "data.txt", utf8("Local Storage")
+                    "testmods/link/InnerStorage.class",
+                    classWithString("testmods/link/InnerStorage", "Local Storage")
             ));
             Path jar = writeJar(tempDir, "nested_link_isolation.jar", Map.of(
                     "testmods/link/Main.class",
@@ -1357,7 +1411,9 @@ public final class SelfTest {
 
         check("Связка: обе части в одном вложенном jar и места в отчёте", () -> {
             byte[] inner = zipBytes(Map.of(
-                    "data.txt", utf8("api.telegram.org\nLocal Storage")
+                    "testmods/link/InnerData.class",
+                    classWithStrings("testmods/link/InnerData",
+                            "api.telegram.org", "Local Storage")
             ));
             Path jar = writeJar(tempDir, "nested_link_same.jar", Map.of(
                     "libs/kotlin-compiler.jar", inner
@@ -1366,10 +1422,12 @@ public final class SelfTest {
             ModScanResult result = scanner.scan(jar);
             assertPointsRulesAndLinks(result, 11, Set.of(2, 4), Set.of("КРАЖА"));
             LinkFinding theft = link(result, "КРАЖА");
-            require(theft.firstLocation().contains("kotlin-compiler.jar!/data.txt"),
+            require(theft.firstLocation().contains(
+                            "kotlin-compiler.jar!/testmods/link/InnerData.class"),
                     "в связке не показано место первой части: "
                             + theft.firstLocation());
-            require(theft.secondLocation().contains("kotlin-compiler.jar!/data.txt"),
+            require(theft.secondLocation().contains(
+                            "kotlin-compiler.jar!/testmods/link/InnerData.class"),
                     "в связке не показано место второй части: "
                             + theft.secondLocation());
 

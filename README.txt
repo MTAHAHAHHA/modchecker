@@ -50,8 +50,9 @@ java -jar build\libs\modchecker.jar C:\образцы\мод.jar.sample
 - текст в .json, .txt, .properties, .cfg;
 - вложенные .jar и .jar.sample до двух уровней;
 - известные строки (Discord/Telegram, данные аккаунтов и браузера, кошельки,
-  Pastebin, Fractureiser); правило Cookies проверяется только в .class,
-  чтобы не ловить имена методов в refmap .json;
+  Pastebin, Fractureiser); правила "Данные браузера" и Cookies проверяются
+  только в .class, чтобы не ловить переводы и имена методов в .json/.txt/
+  .properties;
 - простая маскировка строк: Base64, hex, переворот, XOR, StringBuilder, char[];
 - заметки: до 10 Base64-строк, которые раскрываются в обычный текст
   (очков не дают, нужны для ручной проверки);

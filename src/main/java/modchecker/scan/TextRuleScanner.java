@@ -9,8 +9,9 @@ import java.util.Locale;
  * Проверяет строки правилами 1-8. Одно и то же правило добавляется только
  * один раз, даже если строка встретилась в десяти файлах.
  *
- * Правило 5 (Cookies) проверяется только в строковых константах .class:
- * в refmap и других .json это обычно имена методов Minecraft.
+ * Правила 4 (Данные браузера) и 5 (Cookies) проверяются только в строковых
+ * константах .class: в переводах, refmap и других текстовых файлах это
+ * обычно обычные слова.
  */
 final class TextRuleScanner {
 
@@ -35,7 +36,7 @@ final class TextRuleScanner {
 
         String lowerCase = content.toLowerCase(Locale.ROOT);
         for (SignatureRule rule : SignatureRules.all()) {
-            if (!classConstant && rule.id() == 5) {
+            if (!classConstant && SignatureRules.isClassConstantOnly(rule.id())) {
                 continue;
             }
             if (rule.matches(lowerCase)) {

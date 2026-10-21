@@ -54,4 +54,12 @@ final class SignatureRules {
     static List<SignatureRule> all() {
         return ALL;
     }
+
+    /**
+     * Правила 4 и 5 ищем только в строковых константах .class: в переводах,
+     * refmap и других текстовых файлах это обычно обычные слова.
+     */
+    static boolean isClassConstantOnly(int ruleId) {
+        return ruleId == 4 || ruleId == 5;
+    }
 }

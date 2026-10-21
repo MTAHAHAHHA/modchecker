@@ -8,6 +8,7 @@ out/
 
 # Local secrets and reports
 curseforge_key.txt
+virustotal_key.txt
 trusted_hashes.txt
 modchecker-report*.txt
 

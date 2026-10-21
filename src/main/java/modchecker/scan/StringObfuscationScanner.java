@@ -50,7 +50,7 @@ final class StringObfuscationScanner {
     /**
      * В .json/.txt/.properties/.cfg ищем только скрытые строки.
      * Правило 18 к текстовым файлам не применяется: там бывают
-     * переводы, анимации и длинные mixins. Правило 5 тоже только для .class.
+     * переводы, анимации и длинные mixins. Правила 4 и 5 тоже только для .class.
      */
     void inspectText(String content, String location) {
         if (content == null || content.isEmpty()) {
@@ -79,7 +79,7 @@ final class StringObfuscationScanner {
             List<SignatureRule> matches = SignatureRules.matching(decoded);
             if (!matches.isEmpty()) {
                 for (SignatureRule rule : matches) {
-                    if (classConstant || rule.id() != 5) {
+                    if (classConstant || !SignatureRules.isClassConstantOnly(rule.id())) {
                         reportHidden(rule, "Base64", location);
                     }
                 }
@@ -112,7 +112,7 @@ final class StringObfuscationScanner {
         String lowerCase = content.toLowerCase(Locale.ROOT);
 
         for (SignatureRule rule : SignatureRules.all()) {
-            if (!classConstant && rule.id() == 5) {
+            if (!classConstant && SignatureRules.isClassConstantOnly(rule.id())) {
                 continue;
             }
             for (String pattern : rule.patterns()) {
@@ -157,7 +157,7 @@ final class StringObfuscationScanner {
     private void reportSignatures(String decoded, String encoding, String location,
                                   boolean classConstant) {
         for (SignatureRule rule : SignatureRules.matching(decoded)) {
-            if (classConstant || rule.id() != 5) {
+            if (classConstant || !SignatureRules.isClassConstantOnly(rule.id())) {
                 reportHidden(rule, encoding, location);
             }
         }
