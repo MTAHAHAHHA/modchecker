@@ -666,6 +666,25 @@ public final class SelfTest {
                     "безопасная XOR-строка не должна давать правило 10");
         });
 
+        check("Сканер: числовой XOR с буфером не даёт правило 11 и ЗАГРУЗЧИК", () -> {
+            Path jar = writeJar(tempDir, "numeric_xor_library.jar", Map.of(
+                    "testmods/hash/BufferHash.class", classWithBufferXor(false),
+                    "testmods/hash/ClassFactory.class",
+                    classWithCallAndString("testmods/hash/ClassFactory",
+                            "java/lang/ClassLoader", "defineClass",
+                            "([BII)Ljava/lang/Class;", false, "safe")));
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 4, Set.of(12));
+            require(!result.hasEvidenceRule(11),
+                    "числовой хеш не должен давать улику загрузчика");
+        });
+
+        check("Сканер: XOR записывается в байты без создания String", () -> {
+            Path jar = writeJar(tempDir, "xor_bytes_only.jar", Map.of(
+                    "testmods/hash/BufferHash.class", classWithBufferXor(true)));
+            assertPointsAndRules(scanner.scan(jar), 2, Set.of(11));
+        });
+
         check("Сканер: сборка строки через StringBuilder", () -> {
             ModScanResult result = scanner.scan(extraDir.resolve("symbol_assembly.jar"));
             assertPointsAndRules(result, 6, Set.of(10));
@@ -1478,6 +1497,24 @@ public final class SelfTest {
             assertPointsAndRules(result, 0, Set.of());
         });
 
+        check("Отчёт: пояснение о вложенных библиотеках не скрывает находки", () -> {
+            byte[] library = zipBytes(Map.of(
+                    "library/http/HttpClient.class",
+                    classWithString("library/http/HttpClient", "cookies")));
+            Path jar = writeJar(tempDir, "http_library.jar", Map.of(
+                    "META-INF/jars/http.jar", library));
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 1, Set.of(5));
+            String report = renderReport(result, new OnlineCheckResult(
+                    "0".repeat(40), OnlineStatus.SKIPPED, OnlineStatus.SKIPPED));
+            require(report.contains("Находок во вложенных JAR: 1."),
+                    "нет числа находок из вложенного JAR");
+            require(report.contains("встроенные библиотеки тоже проверяются")
+                            && report.contains("[5] Cookies: +1")
+                            && report.contains("META-INF/jars/http.jar!/"),
+                    "пояснение не должно скрывать правило или место находки");
+        });
+
         check("Сканер: правило 25 - только заметка 0 очков", () -> {
             Path jar = writeJar(tempDir, "name_evidence.jar", Map.of(
                     "testmods/names/NameEvidence.class",
@@ -1844,6 +1881,55 @@ public final class SelfTest {
             require(first.scan().verdict() == Verdict.DANGEROUS,
                     "ОПАСНО должно сортироваться выше ПОДОЗРИТЕЛЬНО");
         });
+    }
+
+    /** Байткод числового XOR и обработки байтов: только генерируется, не загружается. */
+    private static byte[] classWithBufferXor(boolean mutateBytes) {
+        var writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, "testmods/hash/BufferHash",
+                null, "java/lang/Object", null);
+        var method = writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "process", "()[B", null, null);
+        method.visitCode();
+        method.visitInsn(Opcodes.ICONST_4);
+        method.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_BYTE);
+        method.visitVarInsn(Opcodes.ASTORE, 0);
+        method.visitInsn(Opcodes.ICONST_0);
+        method.visitVarInsn(Opcodes.ISTORE, 1);
+        method.visitInsn(Opcodes.ICONST_0);
+        method.visitVarInsn(Opcodes.ISTORE, 2);
+        var loop = new org.objectweb.asm.Label();
+        var done = new org.objectweb.asm.Label();
+        method.visitLabel(loop);
+        method.visitVarInsn(Opcodes.ILOAD, 1);
+        method.visitInsn(Opcodes.ICONST_4);
+        method.visitJumpInsn(Opcodes.IF_ICMPGE, done);
+        if (!mutateBytes) {
+            method.visitVarInsn(Opcodes.ILOAD, 2);
+            method.visitVarInsn(Opcodes.ILOAD, 1);
+            method.visitInsn(Opcodes.IXOR);
+            method.visitVarInsn(Opcodes.ISTORE, 2);
+        }
+        method.visitVarInsn(Opcodes.ALOAD, 0);
+        method.visitVarInsn(Opcodes.ILOAD, 1);
+        method.visitVarInsn(Opcodes.ALOAD, 0);
+        method.visitVarInsn(Opcodes.ILOAD, 1);
+        method.visitInsn(Opcodes.BALOAD);
+        if (mutateBytes) {
+            method.visitIntInsn(Opcodes.BIPUSH, 0x5A);
+            method.visitInsn(Opcodes.IXOR);
+            method.visitInsn(Opcodes.I2B);
+        }
+        method.visitInsn(Opcodes.BASTORE);
+        method.visitIincInsn(1, 1);
+        method.visitJumpInsn(Opcodes.GOTO, loop);
+        method.visitLabel(done);
+        method.visitVarInsn(Opcodes.ALOAD, 0);
+        method.visitInsn(Opcodes.ARETURN);
+        method.visitMaxs(0, 0);
+        method.visitEnd();
+        writer.visitEnd();
+        return writer.toByteArray();
     }
 
     private static void assertPointsAndRules(ModScanResult result, int expectedPoints,

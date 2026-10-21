@@ -176,6 +176,8 @@ final class BytecodeAnalyzer {
         private boolean hasStringFromBytes;
         private boolean hasStringFromChars;
         private boolean hasXor;
+        private boolean pendingXorValue;
+        private boolean hasXorByteStore;
         private boolean hasOpenCommandString;
         private boolean hasRundll32;
         private boolean hasUrlDll;
@@ -212,7 +214,10 @@ final class BytecodeAnalyzer {
         }
 
         boolean hasXorLoop() {
-            return hasXor && backwardJump && hasByteArray;
+            // Числовой XOR в хеше или маске изображения сам по себе не похож на декодер.
+            // Учитываем запись XOR-результата в байты или преобразование байтов в строку.
+            return hasXor && backwardJump && hasByteArray
+                    && (hasXorByteStore || hasStringFromBytes);
         }
 
         boolean hasOpenCommandString() {
@@ -229,6 +234,10 @@ final class BytecodeAnalyzer {
 
         @Override
         public void visitInsn(int opcode) {
+            boolean xorValue = pendingXorValue;
+            if (opcode == Opcodes.BASTORE && xorValue) {
+                hasXorByteStore = true;
+            }
             if (opcode >= Opcodes.ICONST_M1 && opcode <= Opcodes.ICONST_5) {
                 setInt(opcode - Opcodes.ICONST_0);
                 return;
@@ -258,6 +267,8 @@ final class BytecodeAnalyzer {
                     recentInts.clear();
                 }
             }
+            pendingXorValue = opcode == Opcodes.IXOR
+                    || (opcode == Opcodes.I2B && xorValue);
         }
 
         @Override
@@ -517,6 +528,7 @@ final class BytecodeAnalyzer {
         }
 
         private void setInt(int value) {
+            pendingXorValue = false;
             lastInt = value;
             pendingString = null;
             recentInts.add(value);
@@ -526,6 +538,7 @@ final class BytecodeAnalyzer {
         }
 
         private void clearPending() {
+            pendingXorValue = false;
             lastInt = null;
             pendingString = null;
         }

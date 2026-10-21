@@ -97,6 +97,15 @@ public final class ReportPrinter {
                     });
         }
 
+        long nestedFindings = scan.findings().stream()
+                .filter(finding -> finding.location().contains("!/"))
+                .count();
+        if (nestedFindings > 0) {
+            out.println("Находок во вложенных JAR: " + nestedFindings + ".");
+            out.println("Примечание: встроенные библиотеки тоже проверяются. "
+                    + "Их сетевые вызовы, загрузка классов и нативные файлы "
+                    + "сами по себе не доказывают заражение.");
+        }
         out.println("Ссылки, домены, IP и токены:");
         if (scan.foundEntities().isEmpty()) {
             out.println("  нет");
