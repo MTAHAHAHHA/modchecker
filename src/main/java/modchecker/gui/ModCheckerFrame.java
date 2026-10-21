@@ -61,6 +61,7 @@ import java.util.concurrent.ExecutionException;
  */
 public final class ModCheckerFrame extends JFrame {
 
+    private static final Color DANGEROUS_BACKGROUND = new Color(255, 165, 165);
     private static final Color SUSPICIOUS_BACKGROUND = new Color(255, 225, 225);
     private static final Color UNKNOWN_BACKGROUND = new Color(255, 248, 195);
     private static final Color TRUSTED_BACKGROUND = new Color(220, 235, 255);
@@ -641,6 +642,7 @@ public final class ModCheckerFrame extends JFrame {
     }
 
     private void updateTotals() {
+        int dangerous = 0;
         int suspicious = 0;
         int unknown = 0;
         int trusted = 0;
@@ -649,7 +651,9 @@ public final class ModCheckerFrame extends JFrame {
 
         for (ModReport report : reports) {
             Verdict verdict = report.scan().verdict();
-            if (verdict == Verdict.SUSPICIOUS) {
+            if (verdict == Verdict.DANGEROUS) {
+                dangerous++;
+            } else if (verdict == Verdict.SUSPICIOUS) {
                 suspicious++;
             } else if (verdict == Verdict.UNKNOWN) {
                 unknown++;
@@ -666,6 +670,7 @@ public final class ModCheckerFrame extends JFrame {
                 + "   ДОВЕРЕН: " + trusted
                 + "   НЕИЗВЕСТНО: " + unknown
                 + "   ПОДОЗРИТЕЛЬНО: " + suspicious
+                + "   ОПАСНО: " + dangerous
                 + "   ОШИБКА: " + errors);
     }
 
@@ -832,6 +837,7 @@ public final class ModCheckerFrame extends JFrame {
 
     private static Color backgroundFor(Verdict verdict) {
         return switch (verdict) {
+            case DANGEROUS -> DANGEROUS_BACKGROUND;
             case SUSPICIOUS -> SUSPICIOUS_BACKGROUND;
             case UNKNOWN -> UNKNOWN_BACKGROUND;
             case TRUSTED -> TRUSTED_BACKGROUND;

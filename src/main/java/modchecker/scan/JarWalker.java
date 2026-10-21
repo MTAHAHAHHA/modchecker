@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.Locale;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
@@ -22,8 +23,9 @@ final class JarWalker {
     private JarWalker() {
     }
 
-    static List<ArchiveFile> read(Path jarFile) throws IOException {
+    static JarContents read(Path jarFile) throws IOException {
         List<ArchiveFile> files = new ArrayList<>();
+        List<String> suspiciousJars = new ArrayList<>();
 
         try (ZipFile zip = new ZipFile(jarFile.toFile())) {
             Enumeration<? extends ZipEntry> entries = zip.entries();
@@ -36,20 +38,24 @@ final class JarWalker {
                 try (InputStream input = zip.getInputStream(entry)) {
                     data = input.readAllBytes();
                 }
-                handleEntry(entry.getName(), data, "", 0, files);
+                handleEntry(entry.getName(), data, "", 0, files, suspiciousJars);
             }
         }
 
-        return files;
+        return new JarContents(List.copyOf(files), List.copyOf(suspiciousJars));
     }
 
     private static void handleEntry(String entryName, byte[] data, String prefix,
-                                    int depth, List<ArchiveFile> files) {
+                                    int depth, List<ArchiveFile> files,
+                                    List<String> suspiciousJars) {
         String location = prefix + entryName;
 
         if (isJar(entryName)) {
+            if (isSuspiciousJarLocation(entryName)) {
+                suspiciousJars.add(location);
+            }
             if (depth < MAX_NESTED_DEPTH) {
-                readNestedJar(data, location + "!/", depth + 1, files);
+                readNestedJar(data, location + "!/", depth + 1, files, suspiciousJars);
             }
             return;
         }
@@ -58,7 +64,8 @@ final class JarWalker {
     }
 
     private static void readNestedJar(byte[] jarBytes, String prefix, int depth,
-                                      List<ArchiveFile> files) {
+                                      List<ArchiveFile> files,
+                                      List<String> suspiciousJars) {
         try (ZipInputStream zip = new ZipInputStream(new ByteArrayInputStream(jarBytes))) {
             boolean hasEntry = false;
             ZipEntry entry;
@@ -68,7 +75,7 @@ final class JarWalker {
                     continue;
                 }
                 byte[] data = zip.readAllBytes();
-                handleEntry(entry.getName(), data, prefix, depth, files);
+                handleEntry(entry.getName(), data, prefix, depth, files, suspiciousJars);
             }
 
             if (!hasEntry && !looksLikeZip(jarBytes)) {
@@ -81,6 +88,22 @@ final class JarWalker {
 
     private static boolean isJar(String entryName) {
         return ModFinder.isModFileName(entryName);
+    }
+
+    /**
+     * Легальные вложенные jar лежат в META-INF/jars и META-INF/jarjar.
+     * Jar в assets, data, resources или прямо в корне - признак маскировки.
+     */
+    private static boolean isSuspiciousJarLocation(String entryName) {
+        String lower = entryName.replace('\\', '/').toLowerCase(Locale.ROOT);
+        if (lower.startsWith("meta-inf/jars/")
+                || lower.startsWith("meta-inf/jarjar/")) {
+            return false;
+        }
+        return lower.startsWith("assets/")
+                || lower.startsWith("data/")
+                || lower.startsWith("resources/")
+                || !lower.contains("/");
     }
 
     private static boolean looksLikeZip(byte[] data) {

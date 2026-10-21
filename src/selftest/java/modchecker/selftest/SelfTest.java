@@ -64,6 +64,7 @@ public final class SelfTest {
     private static final List<String> EXPECTED_EXTRA_JARS = List.of(
             "asm_calls.jar",
             "clinit_exec.jar",
+            "fake_visual_rat.jar",
             "hidden_max_10.jar",
             "hidden_max_9.jar",
             "paths.jar",
@@ -127,7 +128,7 @@ public final class SelfTest {
             }
         });
 
-        check("Созданы все 8 дополнительных тестовых файлов", () -> {
+        check("Созданы все 9 дополнительных тестовых файлов", () -> {
             List<String> actual = listJarNames(extraDir);
             if (!actual.equals(EXPECTED_EXTRA_JARS)) {
                 throw new IllegalStateException(
@@ -1308,7 +1309,7 @@ public final class SelfTest {
 
         check("Сканер: вложенные jar до двух уровней", () -> {
             ModScanResult result = scanner.scan(nestedJar);
-            assertPointsAndRules(result, 8, Set.of(1, 17));
+            assertPointsAndRules(result, 14, Set.of(1, 17, 24));
 
             require(finding(result, 1).location()
                             .contains("level1.jar!/level2.jar!/deep.txt"),
@@ -1330,7 +1331,7 @@ public final class SelfTest {
                     Map.of("inner.jar.sample", inner));
 
             ModScanResult result = scanner.scan(outer);
-            assertPointsAndRules(result, 4, Set.of(1));
+            assertPointsAndRules(result, 10, Set.of(1, 24));
             require(finding(result, 1).location()
                             .contains("inner.jar.sample!/inside.txt"),
                     "не показан полный путь вложенного .jar.sample: "
@@ -1379,6 +1380,411 @@ public final class SelfTest {
                             && report.contains("часть 2:")
                             && report.contains("kotlin-compiler.jar"),
                     "в отчёте не показаны места обеих частей связки");
+        });
+
+        check("Сканер: правило 24 - jar в assets/data/resources и корне", () -> {
+            byte[] safeInner = zipBytes(Map.of("safe.txt", utf8("hello")));
+            List<String> locations = List.of(
+                    "assets/hidden.jar", "data/hidden.jar",
+                    "resources/hidden.jar", "hidden.jar");
+            int index = 0;
+            for (String location : locations) {
+                Path jar = writeJar(tempDir, "hidden_place_" + index + ".jar",
+                        Map.of(location, safeInner));
+                ModScanResult result = scanner.scan(jar);
+                assertPointsAndRules(result, 6, Set.of(24));
+                require(finding(result, 24).location().contains(location),
+                        "правило 24 не показало путь " + location);
+                index++;
+            }
+        });
+
+        check("Сканер: имя-улика у скрытого jar не даёт ОПАСНО", () -> {
+            byte[] inner = zipBytes(Map.of(
+                    "testmods/names/StealOnly.class",
+                    classWithNamedMethods("testmods/names/StealOnly", "stealData")));
+            Path jar = writeJar(tempDir, "hidden_named_rat.jar",
+                    Map.of("assets/hidden.jar", inner));
+            ModScanResult result = scanner.scan(jar);
+            assertPointsRulesAndLinks(result, 6, Set.of(24, 25), Set.of());
+            require(result.verdict() == Verdict.UNKNOWN,
+                    "имя-улика не должна давать ОПАСНО");
+        });
+
+        check("Сканер: правило 24 не трогает META-INF/jars и jarjar", () -> {
+            byte[] safeInner = zipBytes(Map.of("safe.txt", utf8("hello")));
+            Path jar = writeJar(tempDir, "legal_nested.jar", Map.of(
+                    "META-INF/jars/legal.jar", safeInner,
+                    "META-INF/jarjar/legal2.jar", safeInner));
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 0, Set.of());
+        });
+
+        check("Сканер: правило 25 - только заметка 0 очков", () -> {
+            Path jar = writeJar(tempDir, "name_evidence.jar", Map.of(
+                    "testmods/names/NameEvidence.class",
+                    classWithNamedMethods("testmods/names/NameEvidence",
+                            "value", "stealTelegramData")));
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 0, Set.of(25));
+            require(finding(result, 25).points() == 0,
+                    "правило 25 должно давать 0 очков");
+            require(finding(result, 25).title().contains("заметка"),
+                    "правило 25 должно быть помечено как заметка");
+            require(finding(result, 25).location().contains("stealTelegramData"),
+                    "правило 25 не показало метод stealTelegramData");
+
+            Path safe = writeJar(tempDir, "name_generator.jar", Map.of(
+                    "testmods/names/Generator.class",
+                    classWithNamedMethods("testmods/names/Generator", "operate")));
+            assertPointsAndRules(scanner.scan(safe), 0, Set.of());
+
+            Path c2s = writeJar(tempDir, "name_c2s.jar", Map.of(
+                    "testmods/names/C2SNetwork.class",
+                    classWithNamedMethods("testmods/names/C2SNetwork", "write")));
+            assertPointsAndRules(scanner.scan(c2s), 0, Set.of());
+        });
+
+        check("Сканер: правило 26 - только 3+ разных команды", () -> {
+            Path single = writeJar(tempDir, "rat_command_one.jar", Map.of(
+                    "testmods/commands/Commands.class",
+                    classWithStrings("testmods/commands/Commands", "PASSWORD_STEAL")));
+            assertPointsAndRules(scanner.scan(single), 0, Set.of());
+
+            Path two = writeJar(tempDir, "rat_command_two.jar", Map.of(
+                    "testmods/commands/Commands.class",
+                    classWithStrings("testmods/commands/Commands",
+                            "PASSWORD_STEAL", "DISCORD_STEAL")));
+            assertPointsAndRules(scanner.scan(two), 0, Set.of());
+
+            Path keys = writeJar(tempDir, "rat_command_keys.jar", Map.of(
+                    "testmods/commands/Commands.class",
+                    classWithStrings("testmods/commands/Commands",
+                            "KEY_TYPE", "MOUSE_CLICK", "PASSWORD_STEAL")));
+            assertPointsAndRules(scanner.scan(keys), 0, Set.of());
+
+            Path three = writeJar(tempDir, "rat_command_three.jar", Map.of(
+                    "testmods/commands/Commands.class",
+                    classWithStrings("testmods/commands/Commands",
+                            "PASSWORD_STEAL", "DISCORD_STEAL", "STREAM_START")));
+            ModScanResult threeResult = scanner.scan(three);
+            assertPointsAndRules(threeResult, 6, Set.of(26));
+            require(finding(threeResult, 26).evidence().contains("3+ команд"),
+                    "в правиле 26 нет отметки 3+ команд");
+
+            Path pair = writeJar(tempDir, "rat_file_pair.jar", Map.of(
+                    "testmods/commands/Commands.class",
+                    classWithStrings("testmods/commands/Commands",
+                            "FILE_UPLOAD", "FILE_DOWNLOAD")));
+            assertPointsAndRules(scanner.scan(pair), 0, Set.of());
+
+            Path pairPlus = writeJar(tempDir, "rat_file_pair_plus.jar", Map.of(
+                    "testmods/commands/Commands.class",
+                    classWithStrings("testmods/commands/Commands",
+                            "FILE_UPLOAD", "FILE_DOWNLOAD", "PASSWORD_STEAL",
+                            "STREAM_START")));
+            assertPointsAndRules(scanner.scan(pairPlus), 6, Set.of(26));
+        });
+
+        check("Сканер: правило 27 - реальные API, без Camera", () -> {
+            record WatchCall(String owner, String name, String descriptor,
+                             boolean isInterface, int points) {
+            }
+            List<WatchCall> calls = List.of(
+                    new WatchCall("java/awt/Robot", "createScreenCapture",
+                            "(Ljava/awt/Rectangle;)Ljava/awt/image/BufferedImage;", false, 4),
+                    new WatchCall("javax/sound/sampled/TargetDataLine", "open",
+                            "(Ljavax/sound/sampled/AudioFormat;)V", true, 1),
+                    new WatchCall("com/github/sarxos/webcam/Webcam", "getDefault",
+                            "()Lcom/github/sarxos/webcam/Webcam;", false, 4),
+                    new WatchCall("org/bytedeco/javacv/FrameGrabber", "start",
+                            "()V", false, 4),
+                    new WatchCall("org/openimaj/image/VideoCapture", "grab",
+                            "()V", false, 4),
+                    new WatchCall("org/opencv/videoio/VideoCapture", "read",
+                            "()Z", false, 4),
+                    new WatchCall("org/directshow/VideoCapture", "open",
+                            "()V", false, 4),
+                    new WatchCall("org/bytedeco/avfoundation/AVFoundationFrameGrabber", "start",
+                            "()V", false, 4),
+                    new WatchCall("com/example/MyWebcam", "open",
+                            "()V", false, 4),
+                    new WatchCall("net/minecraft/client/Camera", "setup",
+                            "()V", false, 0),
+                    new WatchCall("net/neoforged/neoforge/client/Camera", "setup",
+                            "()V", false, 0),
+                    new WatchCall("com/example/Camera", "setup",
+                            "()V", false, 0)
+            );
+            int index = 0;
+            for (WatchCall call : calls) {
+                Path jar = writeJar(tempDir, "watch_call_" + index + ".jar", Map.of(
+                        "testmods/watch/WatchCalls.class",
+                        classWithCallAndString("testmods/watch/WatchCalls",
+                                call.owner(), call.name(), call.descriptor(),
+                                call.isInterface(), "safe")));
+                ModScanResult result = scanner.scan(jar);
+                assertPointsAndRules(result, call.points(),
+                        call.points() == 0 ? Set.of() : Set.of(27));
+                if (call.points() > 0) {
+                    require(finding(result, 27).evidence().contains(call.name()),
+                            "правило 27 не показало " + call.name());
+                }
+                index++;
+            }
+        });
+
+        check("Сканер: скрытый jar + экран даёт ОПАСНО, микрофон нет", () -> {
+            byte[] screen = zipBytes(Map.of(
+                    "testmods/watch/ScreenOnly.class",
+                    classWithCallAndString("testmods/watch/ScreenOnly",
+                            "java/awt/Robot", "createScreenCapture",
+                            "(Ljava/awt/Rectangle;)Ljava/awt/image/BufferedImage;",
+                            false, "safe")));
+            Path screenJar = writeJar(tempDir, "hidden_screen_rat.jar",
+                    Map.of("assets/hidden.jar", screen));
+            ModScanResult screenResult = scanner.scan(screenJar);
+            assertPointsRulesAndLinks(screenResult, 20,
+                    Set.of(24, 27), Set.of("КРИТИЧЕСКАЯ"));
+            require(screenResult.verdict() == Verdict.DANGEROUS,
+                    "скрытый jar + захват экрана должен быть ОПАСНО");
+
+            byte[] mic = zipBytes(Map.of(
+                    "testmods/watch/MicOnly.class",
+                    classWithCallAndString("testmods/watch/MicOnly",
+                            "javax/sound/sampled/TargetDataLine", "open",
+                            "(Ljavax/sound/sampled/AudioFormat;)V", true, "safe")));
+            Path micJar = writeJar(tempDir, "hidden_mic.jar",
+                    Map.of("assets/hidden.jar", mic));
+            ModScanResult micResult = scanner.scan(micJar);
+            assertPointsRulesAndLinks(micResult, 7, Set.of(24, 27), Set.of());
+            require(micResult.verdict() == Verdict.UNKNOWN,
+                    "микрофон сам по себе не должен давать ОПАСНО");
+        });
+
+        check("Сканер: скрытый jar + правило 26 или 28 дают ОПАСНО", () -> {
+            byte[] commands = zipBytes(Map.of(
+                    "testmods/commands/Commands.class",
+                    classWithStrings("testmods/commands/Commands",
+                            "STREAM_START", "STREAM_STOP", "MIC_START")));
+            Path commandsJar = writeJar(tempDir, "hidden_commands_rat.jar",
+                    Map.of("assets/hidden.jar", commands));
+            ModScanResult commandsResult = scanner.scan(commandsJar);
+            assertPointsRulesAndLinks(commandsResult, 22,
+                    Set.of(24, 26), Set.of("КРИТИЧЕСКАЯ"));
+            require(commandsResult.verdict() == Verdict.DANGEROUS,
+                    "скрытый jar + 3 команды должен быть ОПАСНО");
+
+            byte[] tokens = zipBytes(Map.of(
+                    "testmods/discord/TokenSignals.class",
+                    classWithStrings("testmods/discord/TokenSignals",
+                            ".ldb", "mfa." + "a".repeat(30))));
+            Path tokensJar = writeJar(tempDir, "hidden_tokens_rat.jar",
+                    Map.of("assets/hidden.jar", tokens));
+            ModScanResult tokensResult = scanner.scan(tokensJar);
+            assertPointsRulesAndLinks(tokensResult, 21,
+                    Set.of(24, 28), Set.of("КРИТИЧЕСКАЯ"));
+            require(tokensResult.verdict() == Verdict.DANGEROUS,
+                    "скрытый jar + кража токена должна быть ОПАСНО");
+        });
+
+        check("Сканер: правило 28 - путь Discord и токен", () -> {
+            String token = "mfa." + "a".repeat(30);
+            List<String> markers = List.of("Local Storage", "leveldb", ".ldb");
+            int index = 0;
+            for (String marker : markers) {
+                Path jar = writeJar(tempDir, "discord_token_" + index + ".jar", Map.of(
+                        "testmods/discord/TokenSignals.class",
+                        classWithStrings("testmods/discord/TokenSignals", marker, token)));
+                ModScanResult result = scanner.scan(jar);
+                if ("Local Storage".equals(marker) || "leveldb".equals(marker)) {
+                    assertPointsAndRules(result, 9, Set.of(4, 28));
+                } else {
+                    assertPointsAndRules(result, 5, Set.of(28));
+                }
+                require(finding(result, 28).evidence().contains("шаблон токена"),
+                        "правило 28 не показало шаблон токена");
+                index++;
+            }
+
+            Path regexSource = writeJar(tempDir, "discord_token_regex.jar", Map.of(
+                    "testmods/discord/TokenSignals.class",
+                    classWithStrings("testmods/discord/TokenSignals",
+                            ".ldb", "[\\w-]{24}\\.[\\w-]{6}\\.[\\w-]{27}|mfa\\.[\\w-]{84}")));
+            assertPointsAndRules(scanner.scan(regexSource), 5, Set.of(28));
+        });
+
+        check("Сканер: правило 29 - только туннели и публичные IP", () -> {
+            Path portmap = writeJar(tempDir, "c2_portmap.jar", Map.of(
+                    "testmods/net/SocketEndpoint.class",
+                    classWithSocket("testmods/net/SocketEndpoint",
+                            "example.portmap.host", 61233)));
+            ModScanResult c2 = scanner.scan(portmap);
+            assertPointsAndRules(c2, 5, Set.of(14, 29));
+            require(finding(c2, 29).evidence().contains("example.portmap.host"),
+                    "правило 29 не показало хост");
+
+            List<String> ordinary = List.of(
+                    "mojang.com", "api.cfwidget.com", "api.mclo.gs", "example.com");
+            int index = 0;
+            for (String host : ordinary) {
+                Path jar = writeJar(tempDir, "c2_ordinary_" + index + ".jar", Map.of(
+                        "testmods/net/KnownEndpoint.class",
+                        classWithSocket("testmods/net/KnownEndpoint", host, 443)));
+                assertPointsAndRules(scanner.scan(jar), 2, Set.of(14));
+                index++;
+            }
+
+            List<String> privateIps = List.of(
+                    "10.1.2.3", "172.16.5.4", "172.31.0.1", "192.168.1.10",
+                    "169.254.1.1", "127.0.0.1", "100.64.0.1");
+            index = 0;
+            for (String host : privateIps) {
+                Path jar = writeJar(tempDir, "c2_private_" + index + ".jar", Map.of(
+                        "testmods/net/PrivateEndpoint.class",
+                        classWithSocket("testmods/net/PrivateEndpoint", host, 25565)));
+                assertPointsAndRules(scanner.scan(jar), 2, Set.of(14));
+                index++;
+            }
+
+            Path publicIp = writeJar(tempDir, "c2_public_ip.jar", Map.of(
+                    "testmods/net/PublicEndpoint.class",
+                    classWithSocket("testmods/net/PublicEndpoint", "8.8.8.8", 443)));
+            assertPointsAndRules(scanner.scan(publicIp), 5, Set.of(14, 29));
+
+            List<String> tunnels = List.of(
+                    "abc.ngrok.io", "a.duckdns.org", "x.loca.lt",
+                    "x.trycloudflare.com", "x.serveo.net", "x.no-ip.org");
+            index = 0;
+            for (String host : tunnels) {
+                Path jar = writeJar(tempDir, "c2_tunnel_" + index + ".jar", Map.of(
+                        "testmods/net/TunnelEndpoint.class",
+                        classWithSocket("testmods/net/TunnelEndpoint", host, 443)));
+                assertPointsAndRules(scanner.scan(jar), 5, Set.of(14, 29));
+                index++;
+            }
+
+            Path url = writeJar(tempDir, "c2_url.jar", Map.of(
+                    "testmods/net/UrlEndpoint.class",
+                    classWithUrl("testmods/net/UrlEndpoint",
+                            "https://abc.ngrok.io/api")));
+            assertPointsAndRules(scanner.scan(url), 3, Set.of(29));
+
+            Path knownUrl = writeJar(tempDir, "c2_known_url.jar", Map.of(
+                    "testmods/net/KnownUrl.class",
+                    classWithUrl("testmods/net/KnownUrl",
+                            "https://api.cfwidget.com/mod")));
+            assertPointsAndRules(scanner.scan(knownUrl), 0, Set.of());
+        });
+
+        check("Отчёт: ссылки, домены, IP и токены", () -> {
+            Path jar = writeJar(tempDir, "entities.jar", Map.of(
+                    "testmods/report/Entities.class",
+                    classWithStrings("testmods/report/Entities",
+                            "https://discord.com/api/webhooks/123456789012345678/abcdef",
+                            "https://api.cfwidget.com/mod",
+                            "8.8.8.8",
+                            "mfa." + "a".repeat(30))));
+            ModScanResult result = scanner.scan(jar);
+            assertPointsAndRules(result, 4, Set.of(1));
+            require(result.foundEntities().stream()
+                            .anyMatch(entity -> entity.kind().equals("вебхук Discord")),
+                    "не найден вебхук Discord");
+            require(result.foundEntities().stream()
+                            .anyMatch(entity -> entity.kind().equals("домен")
+                                    && entity.value().equals("api.cfwidget.com")),
+                    "не найден обычный домен");
+            require(result.foundEntities().stream()
+                            .anyMatch(entity -> entity.kind().equals("IP")
+                                    && entity.value().equals("8.8.8.8")),
+                    "не найден IP-адрес");
+            require(result.foundEntities().stream()
+                            .anyMatch(entity -> entity.kind().equals("токен Discord")),
+                    "не найден токен Discord");
+
+            String report = renderReport(result, new OnlineCheckResult(
+                    "0".repeat(40), OnlineStatus.SKIPPED, OnlineStatus.SKIPPED));
+            require(report.contains("Ссылки, домены, IP и токены:"),
+                    "в отчёте нет раздела ссылок");
+            require(report.contains("вебхук Discord:")
+                            && report.contains("домен: api.cfwidget.com")
+                            && report.contains("IP: 8.8.8.8")
+                            && report.contains("токен Discord:"),
+                    "в отчёте не все найденные сущности");
+        });
+
+        check("Сканер: fake_visual_rat остаётся ОПАСНО", () -> {
+            ModScanResult result = scanner.scan(
+                    extraDir.resolve("fake_visual_rat.jar"));
+            assertPointsRulesAndLinks(result, 21,
+                    Set.of(14, 24, 25, 29), Set.of("КРИТИЧЕСКАЯ"));
+            require(result.verdict() == Verdict.DANGEROUS,
+                    "fake_visual_rat должен быть ОПАСНО, получен "
+                            + result.verdict().label());
+
+            LinkFinding critical = link(result, "КРИТИЧЕСКАЯ");
+            require(critical.points() == 10,
+                    "критическая связка должна давать +10");
+            require(critical.firstLocation().contains("assets/fake/libs.jar")
+                            && critical.secondLocation().contains("assets/fake/libs.jar"),
+                    "в критической связке нет мест обеих частей: "
+                            + critical.firstLocation() + " / " + critical.secondLocation());
+            require(result.evidenceLocations(24).stream()
+                            .anyMatch(location -> location.scope()
+                                    .equals("assets/fake/libs.jar")),
+                    "правило 24 должно относиться к области спрятанного jar");
+
+            String report = renderReport(result, new OnlineCheckResult(
+                    "0".repeat(40), OnlineStatus.SKIPPED, OnlineStatus.SKIPPED));
+            require(report.contains("!!! КРИТИЧЕСКАЯ СВЯЗКА (RAT): +10 !!!"),
+                    "в отчёте нет крупной критической связки");
+            require(report.contains("часть 1:")
+                            && report.contains("часть 2:")
+                            && report.contains("assets/fake/libs.jar"),
+                    "в отчёте нет мест обеих частей критической связки");
+            require(report.contains("Ссылки, домены, IP и токены:")
+                            && report.contains("домен: example.portmap.host"),
+                    "в отчёте нет найденного домена");
+            require(report.contains("ОПАСНО: 1"),
+                    "в итогах отчёта нет ОПАСНО");
+        });
+
+        check("Вердикт: подтверждение сайта не даёт ОПАСНО", () -> {
+            ModScanResult result = scanner.scan(
+                    extraDir.resolve("fake_visual_rat.jar"));
+            require(result.verdict() == Verdict.DANGEROUS,
+                    "до подтверждения fake_visual_rat должен быть ОПАСНО");
+            result.markOnlineConfirmed();
+            require(result.verdict() == Verdict.SUSPICIOUS,
+                    "подтверждённый сайт не может быть ОПАСНО: "
+                            + result.verdict().label());
+            String report = renderReport(result, new OnlineCheckResult(
+                    "0".repeat(40), OnlineStatus.CONFIRMED, OnlineStatus.SKIPPED));
+            require(report.contains("вердикт ограничен ПОДОЗРИТЕЛЬНО"),
+                    "в отчёте нет пояснения об ограничении вердикта");
+        });
+
+        check("Вердикт: ручное доверие не отменяет ОПАСНО, ошибка важнее", () -> {
+            ModScanResult result = scanner.scan(
+                    extraDir.resolve("fake_visual_rat.jar"));
+            result.markManuallyTrusted("тест", "тест");
+            require(result.verdict() == Verdict.DANGEROUS,
+                    "ручное доверие не должно отменять ОПАСНО");
+            result.markError("тестовая ошибка");
+            require(result.verdict() == Verdict.ERROR,
+                    "ОШИБКА должна быть важнее ОПАСНО");
+        });
+
+        check("Таблица: ОПАСНО идёт выше ПОДОЗРИТЕЛЬНО", () -> {
+            ModTableModel model = new ModTableModel();
+            model.setReports(List.of(
+                    tableReport("danger.jar", 10, false, false, true),
+                    tableReport("suspicious.jar", 12, false, false)));
+            var sorter = ModTableModel.createSorter(model);
+            sorter.sort();
+            ModReport first = model.reportAt(sorter.convertRowIndexToModel(0));
+            require(first.scan().verdict() == Verdict.DANGEROUS,
+                    "ОПАСНО должно сортироваться выше ПОДОЗРИТЕЛЬНО");
         });
     }
 
@@ -1432,6 +1838,12 @@ public final class SelfTest {
 
     private static ModReport tableReport(String name, int points,
                                          boolean error, boolean confirmed) {
+        return tableReport(name, points, error, confirmed, false);
+    }
+
+    private static ModReport tableReport(String name, int points,
+                                         boolean error, boolean confirmed,
+                                         boolean dangerous) {
         ModScanResult scan = new ModScanResult(Path.of(name));
         if (error) {
             scan.markError("файл битый или не мод");
@@ -1441,6 +1853,9 @@ public final class SelfTest {
         }
         if (confirmed) {
             scan.markOnlineConfirmed();
+        }
+        if (dangerous) {
+            scan.markDangerous();
         }
         OnlineCheckResult online = new OnlineCheckResult(
                 "0".repeat(40), OnlineStatus.SKIPPED, OnlineStatus.SKIPPED);
@@ -1461,6 +1876,93 @@ public final class SelfTest {
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException(
                         "нет связки " + name + " в " + result.name()));
+    }
+
+    private static byte[] classWithNamedMethods(String className, String... methodNames) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        for (String methodName : methodNames) {
+            MethodVisitor method = writer.visitMethod(
+                    Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                    methodName, "()V", null, null);
+            method.visitCode();
+            method.visitInsn(Opcodes.RETURN);
+            method.visitMaxs(0, 0);
+            method.visitEnd();
+        }
+
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] classWithStrings(String className, String... values) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        MethodVisitor method = writer.visitMethod(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "value", "()V", null, null);
+        method.visitCode();
+        for (String value : values) {
+            method.visitLdcInsn(value);
+            method.visitInsn(Opcodes.POP);
+        }
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(1, 0);
+        method.visitEnd();
+
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] classWithSocket(String className, String host, int port) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        MethodVisitor method = writer.visitMethod(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "connect", "()V", null, null);
+        method.visitCode();
+        method.visitTypeInsn(Opcodes.NEW, "java/net/Socket");
+        method.visitInsn(Opcodes.DUP);
+        method.visitLdcInsn(host);
+        method.visitLdcInsn(port);
+        method.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/net/Socket",
+                "<init>", "(Ljava/lang/String;I)V", false);
+        method.visitInsn(Opcodes.POP);
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(4, 0);
+        method.visitEnd();
+
+        writer.visitEnd();
+        return writer.toByteArray();
+    }
+
+    private static byte[] classWithUrl(String className, String url) {
+        ClassWriter writer = new ClassWriter(0);
+        writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, className, null,
+                "java/lang/Object", null);
+
+        MethodVisitor method = writer.visitMethod(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "endpoint", "()V", null, null);
+        method.visitCode();
+        method.visitTypeInsn(Opcodes.NEW, "java/net/URL");
+        method.visitInsn(Opcodes.DUP);
+        method.visitLdcInsn(url);
+        method.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/net/URL",
+                "<init>", "(Ljava/lang/String;)V", false);
+        method.visitInsn(Opcodes.POP);
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(3, 0);
+        method.visitEnd();
+
+        writer.visitEnd();
+        return writer.toByteArray();
     }
 
     private static byte[] classWithString(String className, String value) {

@@ -17,6 +17,7 @@ public final class ModScanResult {
     public static final int SUSPICIOUS_THRESHOLD = 10;
 
     private static final int MAX_DECODED_NOTES = 10;
+    private static final int MAX_FOUND_ENTITIES = 100;
     private static final String MAIN_SCOPE = "основной код";
 
     private final Path file;
@@ -25,9 +26,12 @@ public final class ModScanResult {
             new LinkedHashMap<>();
     private final List<LinkFinding> links = new ArrayList<>();
     private final List<DecodedNote> decodedNotes = new ArrayList<>();
+    private final List<FoundEntity> foundEntities = new ArrayList<>();
+    private final List<EvidenceLocation> criticalHarm = new ArrayList<>();
     private final Set<Integer> evidenceRules = new HashSet<>();
     private boolean onlineConfirmed;
     private boolean manuallyTrusted;
+    private boolean dangerous;
     private String trustSource;
     private String trustComment;
     private String error;
@@ -71,6 +75,43 @@ public final class ModScanResult {
         }
     }
 
+    /**
+     * Ссылки, домены, IP-адреса и токены для ручной проверки.
+     */
+    public List<FoundEntity> foundEntities() {
+        return List.copyOf(foundEntities);
+    }
+
+    public void addFoundEntity(String kind, String value, String location) {
+        if (kind == null || value == null || value.isBlank()
+                || foundEntities.size() >= MAX_FOUND_ENTITIES) {
+            return;
+        }
+        boolean alreadyPresent = foundEntities.stream()
+                .anyMatch(entity -> entity.kind().equals(kind)
+                        && entity.value().equals(value));
+        if (!alreadyPresent) {
+            foundEntities.add(new FoundEntity(kind, value, location));
+        }
+    }
+
+    /**
+     * Высоконадёжная вредная часть для критической связки. Правило 25
+     * (имена-улики) сюда не попадает: оно остаётся только заметкой.
+     */
+    public List<EvidenceLocation> criticalHarmLocations() {
+        return List.copyOf(criticalHarm);
+    }
+
+    public void markCriticalHarm(String location) {
+        String safeLocation = location == null ? "" : location;
+        EvidenceLocation entry = new EvidenceLocation(
+                0, safeLocation, scopeOf(safeLocation));
+        if (!criticalHarm.contains(entry)) {
+            criticalHarm.add(entry);
+        }
+    }
+
     public boolean hasRule(int rule) {
         return findings.containsKey(rule);
     }
@@ -82,6 +123,16 @@ public final class ModScanResult {
     public void markEvidenceRule(int rule, String location) {
         evidenceRules.add(rule);
         addEvidenceLocation(rule, location);
+    }
+
+    /**
+     * Как markEvidenceRule, но с явной областью. Нужно правилу 24: сам
+     * спрятанный jar лежит в родительском архиве, а связка должна считаться
+     * с находками внутри этого jar.
+     */
+    public void markEvidenceRule(int rule, String location, String scope) {
+        evidenceRules.add(rule);
+        addEvidenceLocation(rule, location, scope);
     }
 
     public boolean hasEvidenceRule(int rule) {
@@ -103,6 +154,16 @@ public final class ModScanResult {
 
     public void addFinding(Finding finding) {
         recordFindingEvidence(finding);
+        findings.putIfAbsent(finding.rule(), finding);
+    }
+
+    /**
+     * Добавляет находку с заданной областью. Используется для правила 24,
+     * чтобы спрятанный jar был виден связке как отдельная область.
+     */
+    public void addFindingWithScope(Finding finding, String scope) {
+        evidenceRules.add(finding.rule());
+        addEvidenceLocation(finding.rule(), finding.location(), scope);
         findings.putIfAbsent(finding.rule(), finding);
     }
 
@@ -147,13 +208,16 @@ public final class ModScanResult {
     }
 
     /**
-     * Порог 10 очков важнее подтверждения сайта: подозрительный мод
-     * остаётся подозрительным, даже если файл совпал с официальной страницей.
-     * Ручное доверие важнее очков, но не отменяет показ находок.
+     * Подтверждение на Modrinth или CurseForge ограничивает вердикт:
+     * официальный файл не может быть ОПАСНО. Ручное доверие по-прежнему
+     * не отменяет критическую связку у неподтверждённого файла.
      */
     public Verdict verdict() {
         if (hasError()) {
             return Verdict.ERROR;
+        }
+        if (dangerous && !onlineConfirmed) {
+            return Verdict.DANGEROUS;
         }
         if (manuallyTrusted) {
             return Verdict.TRUSTED;
@@ -176,6 +240,19 @@ public final class ModScanResult {
      */
     public void markOnlineConfirmed() {
         onlineConfirmed = true;
+    }
+
+    /**
+     * Критическая связка высоконадёжной вредной части с правилом 24 или 29.
+     * У файла, подтверждённого на сайте, вердикт всё равно не выше
+     * ПОДОЗРИТЕЛЬНО.
+     */
+    public boolean isDangerous() {
+        return dangerous;
+    }
+
+    public void markDangerous() {
+        dangerous = true;
     }
 
     public boolean isManuallyTrusted() {
@@ -216,8 +293,11 @@ public final class ModScanResult {
         evidenceLocations.clear();
         links.clear();
         decodedNotes.clear();
+        foundEntities.clear();
+        criticalHarm.clear();
         evidenceRules.clear();
         onlineConfirmed = false;
+        dangerous = false;
         clearManualTrust();
     }
 
@@ -228,8 +308,14 @@ public final class ModScanResult {
 
     private void addEvidenceLocation(int rule, String location) {
         String safeLocation = location == null ? "" : location;
-        EvidenceLocation entry = new EvidenceLocation(
-                rule, safeLocation, scopeOf(safeLocation));
+        addEvidenceLocation(rule, safeLocation, scopeOf(safeLocation));
+    }
+
+    private void addEvidenceLocation(int rule, String location, String scope) {
+        String safeLocation = location == null ? "" : location;
+        String safeScope = scope == null || scope.isBlank()
+                ? scopeOf(safeLocation) : scope;
+        EvidenceLocation entry = new EvidenceLocation(rule, safeLocation, safeScope);
         List<EvidenceLocation> locations = evidenceLocations.computeIfAbsent(
                 rule, ignored -> new ArrayList<>());
         if (!locations.contains(entry)) {
@@ -242,10 +328,18 @@ public final class ModScanResult {
      * вложенного jar - путь этого jar, например level1.jar!/level2.jar.
      */
     private static String scopeOf(String location) {
-        int nested = location.lastIndexOf("!/");
+        String path = location;
+        int prefix = path.indexOf(" - ");
+        if (prefix >= 0) {
+            path = path.substring(prefix + 3);
+        } else if (path.startsWith("файл ")) {
+            path = path.substring("файл ".length());
+        }
+
+        int nested = path.lastIndexOf("!/");
         if (nested < 0) {
             return MAIN_SCOPE;
         }
-        return location.substring(0, nested);
+        return path.substring(0, nested);
     }
 }

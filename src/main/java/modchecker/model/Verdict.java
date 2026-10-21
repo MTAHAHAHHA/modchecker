@@ -5,6 +5,7 @@ package modchecker.model;
  */
 public enum Verdict {
 
+    DANGEROUS("ОПАСНО"),
     SUSPICIOUS("ПОДОЗРИТЕЛЬНО"),
     UNKNOWN("НЕИЗВЕСТНО"),
     TRUSTED("ДОВЕРЕН (вручную)"),

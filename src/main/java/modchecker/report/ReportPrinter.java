@@ -2,6 +2,7 @@ package modchecker.report;
 
 import modchecker.model.DecodedNote;
 import modchecker.model.Finding;
+import modchecker.model.FoundEntity;
 import modchecker.model.LinkFinding;
 import modchecker.model.ModScanResult;
 import modchecker.model.Verdict;
@@ -17,6 +18,8 @@ import java.util.List;
  * Печатает отчёт по каждому моду, общие итоги и обязательные строки в конце.
  */
 public final class ReportPrinter {
+
+    private static final String CRITICAL_LINK = "КРИТИЧЕСКАЯ";
 
     private ReportPrinter() {
     }
@@ -94,11 +97,46 @@ public final class ReportPrinter {
                     });
         }
 
-        if (scan.links().isEmpty()) {
-            out.println("Связки: нет");
+        out.println("Ссылки, домены, IP и токены:");
+        if (scan.foundEntities().isEmpty()) {
+            out.println("  нет");
+        } else {
+            for (FoundEntity entity : scan.foundEntities()) {
+                out.println("  " + entity.kind() + ": " + entity.value()
+                        + " - " + entity.location());
+            }
+        }
+
+        if (scan.isOnlineConfirmed() && scan.isDangerous()) {
+            out.println("Примечание: файл подтверждён на сайте, вердикт ограничен "
+                    + "ПОДОЗРИТЕЛЬНО.");
+        }
+
+        LinkFinding critical = scan.links().stream()
+                .filter(link -> CRITICAL_LINK.equals(link.name()))
+                .findFirst()
+                .orElse(null);
+        if (critical != null) {
+            out.println();
+            out.println("!!! КРИТИЧЕСКАЯ СВЯЗКА (RAT): +" + critical.points() + " !!!");
+            out.println("      " + critical.location());
+            out.println("      часть 1: " + critical.firstLocation());
+            out.println("      часть 2: " + critical.secondLocation());
+            out.println("      " + critical.evidence());
+        }
+
+        List<LinkFinding> regularLinks = scan.links().stream()
+                .filter(link -> !CRITICAL_LINK.equals(link.name()))
+                .toList();
+        if (regularLinks.isEmpty()) {
+            if (critical == null) {
+                out.println("Связки: нет");
+            } else {
+                out.println("Связки: критическая выше");
+            }
         } else {
             out.println("Связки:");
-            for (LinkFinding link : scan.links()) {
+            for (LinkFinding link : regularLinks) {
                 out.println("  " + link.name() + ": +" + link.points());
                 out.println("      " + link.location());
                 out.println("      часть 1: " + link.firstLocation());
@@ -117,6 +155,7 @@ public final class ReportPrinter {
     }
 
     private static void printTotals(List<ModReport> reports, PrintStream out) {
+        int dangerous = 0;
         int suspicious = 0;
         int unknown = 0;
         int trusted = 0;
@@ -129,7 +168,9 @@ public final class ReportPrinter {
         for (ModReport report : reports) {
             ModScanResult scan = report.scan();
             Verdict verdict = scan.verdict();
-            if (verdict == Verdict.SUSPICIOUS) {
+            if (verdict == Verdict.DANGEROUS) {
+                dangerous++;
+            } else if (verdict == Verdict.SUSPICIOUS) {
                 suspicious++;
             } else if (verdict == Verdict.UNKNOWN) {
                 unknown++;
@@ -149,6 +190,7 @@ public final class ReportPrinter {
         out.println();
         out.println("=== ИТОГО ===");
         out.println("Проверено модов: " + reports.size());
+        out.println("ОПАСНО: " + dangerous);
         out.println("ПОДОЗРИТЕЛЬНО: " + suspicious);
         out.println("НЕИЗВЕСТНО: " + unknown);
         out.println("ДОВЕРЕН (вручную): " + trusted);

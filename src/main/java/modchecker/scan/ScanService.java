@@ -12,7 +12,8 @@ import java.util.Locale;
 /**
  * Проверка одного мода: читаем содержимое, ищем строки по правилам 1-8,
  * маскировку и энтропию (9, 18, 19; правило 18 - только в .class),
- * байткод (10-16, 22-23), имена классов (20, 21) и исполняемые файлы (17).
+ * байткод (10-16, 22-23, 27, 29), имена классов (20, 21), RAT-признаки
+ * (24-26, 28) и исполняемые файлы (17).
  */
 public final class ScanService {
 
@@ -27,15 +28,20 @@ public final class ScanService {
     public ModScanResult scan(Path modFile) {
         ModScanResult result = new ModScanResult(modFile);
 
-        List<ArchiveFile> files;
+        JarContents contents;
         try {
-            files = JarWalker.read(modFile);
+            contents = JarWalker.read(modFile);
         } catch (IOException e) {
             result.markError("файл битый или не мод");
             return result;
         }
+        List<ArchiveFile> files = contents.files();
+
+        reportHiddenJars(contents.suspiciousJars(), result);
 
         TextRuleScanner textRules = new TextRuleScanner(result);
+        RatScanner rat = new RatScanner(result);
+        EntityScanner entities = new EntityScanner(result);
         StringObfuscationScanner obfuscation = new StringObfuscationScanner(result);
         ExternalPathScanner externalPaths = new ExternalPathScanner(result);
         LargeFileScanner largeFiles = new LargeFileScanner(result);
@@ -48,12 +54,14 @@ public final class ScanService {
             String lowerName = file.entryName().toLowerCase(Locale.ROOT);
 
             if (lowerName.endsWith(".class")) {
-                scanClass(file, result, textRules, obfuscation, externalPaths,
-                        hardwareIds, bytecodeState);
+                scanClass(file, result, textRules, rat, entities, obfuscation,
+                        externalPaths, hardwareIds, bytecodeState);
             } else if (isTextFile(lowerName)) {
                 String content = new String(file.data(), StandardCharsets.UTF_8);
                 String location = "файл " + file.location();
                 textRules.inspectText(content, location);
+                rat.inspectString(content, location);
+                entities.inspect(content, location);
                 obfuscation.inspectText(content, location);
                 externalPaths.inspect(content, location);
             }
@@ -86,6 +94,8 @@ public final class ScanService {
             ));
         }
 
+        rat.finish();
+
         List<String> classNames = ClassNameScanner.simpleNames(files);
         hardwareIds.finish(classNames);
         ClassNameScanner.inspectNames(classNames, result);
@@ -96,6 +106,8 @@ public final class ScanService {
 
     private void scanClass(ArchiveFile file, ModScanResult result,
                            TextRuleScanner textRules,
+                           RatScanner rat,
+                           EntityScanner entities,
                            StringObfuscationScanner obfuscation,
                            ExternalPathScanner externalPaths,
                            HardwareIdScanner hardwareIds,
@@ -106,6 +118,8 @@ public final class ScanService {
                         + ", метод " + constant.methodName()
                         + " - " + file.location();
                 textRules.inspectClassConstant(constant.value(), location);
+                rat.inspectString(constant.value(), location);
+                entities.inspect(constant.value(), location);
                 obfuscation.inspectClassConstant(constant.value(), location);
                 externalPaths.inspect(constant.value(), location);
                 hardwareIds.inspectClassConstant(
@@ -131,13 +145,106 @@ public final class ScanService {
             bytecodeState.dangerousXorFound = true;
         }
 
+        rat.inspectNames(analysis.className(), analysis.methodNames(), file.location());
+
         for (HardwareCall call : analysis.hardwareCalls()) {
             hardwareIds.inspectCall(call, file.location());
         }
 
         addDangerousCalls(analysis, file, result);
+        addSurveillanceCalls(analysis, file, result);
+        addC2Calls(analysis, file, result);
         addDecodedStrings(analysis.xorStrings(), analysis, file, result);
         addDecodedStrings(analysis.assembledStrings(), analysis, file, result);
+    }
+
+    private void reportHiddenJars(List<String> suspiciousJars, ModScanResult result) {
+        if (suspiciousJars.isEmpty()) {
+            return;
+        }
+
+        String first = suspiciousJars.get(0);
+        result.addFindingWithScope(new Finding(
+                24,
+                "Jar спрятан в ресурсах",
+                6,
+                "файл " + first,
+                "вложенный jar вне META-INF/jars и META-INF/jarjar"
+        ), first);
+
+        for (int i = 1; i < suspiciousJars.size(); i++) {
+            String hidden = suspiciousJars.get(i);
+            result.markEvidenceRule(24, "файл " + hidden, hidden);
+        }
+    }
+
+    private void addSurveillanceCalls(BytecodeAnalysis analysis, ArchiveFile file,
+                                      ModScanResult result) {
+        if (analysis.surveillanceCalls().isEmpty()) {
+            return;
+        }
+
+        boolean screenOrWebcam = analysis.surveillanceCalls().stream()
+                .anyMatch(call -> !"микрофон".equals(call.kind()));
+        boolean microphone = analysis.surveillanceCalls().stream()
+                .anyMatch(call -> "микрофон".equals(call.kind()));
+        int points = (screenOrWebcam ? 4 : 0) + (microphone ? 1 : 0);
+
+        SurveillanceCall first = analysis.surveillanceCalls().stream()
+                .filter(call -> screenOrWebcam && !"микрофон".equals(call.kind()))
+                .findFirst()
+                .orElse(analysis.surveillanceCalls().get(0));
+        String firstLocation = "класс " + first.className()
+                + ", метод " + first.methodName()
+                + " - " + file.location();
+        StringBuilder evidence = new StringBuilder("вызовы: ");
+        for (int i = 0; i < analysis.surveillanceCalls().size(); i++) {
+            SurveillanceCall call = analysis.surveillanceCalls().get(i);
+            if (i > 0) {
+                evidence.append("; ");
+            }
+            evidence.append(call.owner().replace('/', '.'))
+                    .append('.').append(call.calledName())
+                    .append(" (").append(call.kind()).append(')');
+            if (!"микрофон".equals(call.kind())) {
+                String location = "класс " + call.className()
+                        + ", метод " + call.methodName()
+                        + " - " + file.location();
+                result.markCriticalHarm(location);
+            }
+        }
+
+        result.addFinding(new Finding(
+                27,
+                "Слежка",
+                points,
+                firstLocation,
+                evidence.toString()
+        ));
+    }
+
+    private void addC2Calls(BytecodeAnalysis analysis, ArchiveFile file,
+                            ModScanResult result) {
+        for (C2Call call : analysis.c2Calls()) {
+            String location = "класс " + call.className()
+                    + ", метод " + call.methodName()
+                    + " - " + file.location();
+            if (call.host().matches("\\d{1,3}(\\.\\d{1,3}){3}")) {
+                result.addFoundEntity("IP", call.host(), location);
+            } else {
+                result.addFoundEntity("домен", call.host(), location);
+            }
+            if (result.hasRule(29)) {
+                continue;
+            }
+            result.addFinding(new Finding(
+                    29,
+                    "C2-подключение",
+                    3,
+                    location,
+                    call.kind() + ": " + call.host()
+            ));
+        }
     }
 
     private void addDangerousCalls(BytecodeAnalysis analysis, ArchiveFile file,
