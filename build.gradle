@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'modchecker'
-version = '0.1.0'
+version = '1.1'
 
 repositories {
     mavenCentral()
@@ -90,6 +90,19 @@ tasks.register('selfTest', JavaExec) {
     mainClass = 'modchecker.selftest.SelfTest'
     args testModsDir.get().asFile.absolutePath,
             testModsExtraDir.get().asFile.absolutePath
+}
+
+tasks.register('realModsTest', JavaExec) {
+    group = 'verification'
+    description = 'Проверяет реальные моды из папки -PrealModsDir=... на ложные ОПАСНО.'
+
+    dependsOn tasks.named('selftestClasses')
+
+    classpath = sourceSets.selftest.runtimeClasspath
+    mainClass = 'modchecker.selftest.RealModsTest'
+
+    args providers.gradleProperty('realModsDir')
+            .getOrElse(layout.buildDirectory.dir('realmods').get().asFile.absolutePath)
 }
 
 tasks.register('guiSmoke', JavaExec) {

@@ -63,7 +63,7 @@ public final class Main {
             return;
         }
 
-        System.out.println("ModChecker 0.1.0 - шаг 7");
+        System.out.println("ModChecker 1.1");
         System.out.println("Цель: " + target);
         System.out.println("Найдено модов: " + mods.size());
 
