@@ -1003,6 +1003,9 @@ public final class SelfTest {
                 QuickCheckSelfTest.fullScan(extraDir));
         check("Быстрая проверка: таблица и отчёт не обещают анализ кода", () ->
                 QuickCheckSelfTest.presentation());
+        check("Стоп: полная проверка и продолжение без повторов", () -> ScanControlSelfTest.full(modsDir, extraDir));
+        check("Стоп: быстрая проверка во время хеширования", () -> ScanControlSelfTest.duringHashing(tempDir));
+        check("Стоп: завершение пакета и продолжение очереди", () -> ScanControlSelfTest.betweenBatches(tempDir));
         for (String kind : List.of("entry", "total", "count", "class", "nested")) {
             check("Ограничения архива: " + kind, () -> ModernizationSelfTest.limits(tempDir, kind));
         }

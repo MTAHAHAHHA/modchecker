@@ -81,6 +81,8 @@ public final class QuickCheckGuiSmoke {
             await(reference.get());
             SwingUtilities.invokeAndWait(() -> require(reference.get().getReports().stream().allMatch(r -> r.fullScan()), "переключатель полной проверки не работает"));
             System.out.println("[OK] GUI: основной переключатель режима запускает полную проверку");
+            ScanProgressGuiSmoke.run(Path.of(args[0], "clean.jar"), Path.of(args[1], "fake_visual_rat.jar"),
+                    dir.resolveSibling("scan-progress-gui-smoke"));
         } finally {
             if (reference.get() != null) SwingUtilities.invokeAndWait(() -> {
                 reference.get().dispose();

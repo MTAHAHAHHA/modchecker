@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * Общий проход по списку модов: сканирование файла и онлайн-проверка.
@@ -35,10 +36,17 @@ public final class ScanBatch {
 
     public static List<ModReport> scan(List<Path> mods, OnlineChecker onlineChecker,
                                        Listener listener, ScanLimits limits) {
+        return scan(mods, onlineChecker, listener, limits, () -> false);
+    }
+
+    /** Останавливается между файлами, сохраняя полностью готовые результаты. */
+    public static List<ModReport> scan(List<Path> mods, OnlineChecker onlineChecker,
+                                       Listener listener, ScanLimits limits, BooleanSupplier stopRequested) {
         ScanService scanner = new ScanService(limits);
         List<ModReport> reports = new ArrayList<>();
 
         for (int i = 0; i < mods.size(); i++) {
+            if (stopRequested.getAsBoolean()) break;
             Path mod = mods.get(i);
             ModScanResult scan = scanner.scan(mod);
             OnlineCheckResult online = onlineChecker.check(mod, scan);
@@ -58,19 +66,31 @@ public final class ScanBatch {
     public static List<ModReport> checkSites(List<Path> mods, OnlineChecker checker,
                                              Listener listener,
                                              BiConsumer<Integer, Integer> hashingProgress) {
-        List<OnlineCheckResult> online = checker.checkFiles(mods, hashingProgress);
+        return checkSites(mods, checker, listener, hashingProgress, () -> false);
+    }
+
+    public static List<ModReport> checkSites(List<Path> mods, OnlineChecker checker,
+                                             Listener listener, BiConsumer<Integer, Integer> hashingProgress,
+                                             BooleanSupplier stopRequested) {
         List<ModReport> reports = new ArrayList<>();
-        for (int i = 0; i < mods.size(); i++) {
-            ModScanResult scan = new ModScanResult(mods.get(i));
-            if (online.get(i).sha1() == null) {
-                scan.markError("не удалось прочитать файл и вычислить SHA-1");
-            } else if (online.get(i).confirmed()) {
-                scan.markOnlineConfirmed();
-            }
-            ModReport report = new ModReport(scan, online.get(i), false);
-            reports.add(report);
-            if (listener != null) {
-                listener.modScanned(i + 1, mods.size(), report);
+        for (int start = 0; start < mods.size() && !stopRequested.getAsBoolean(); start += 100) {
+            final int offset = start;
+            List<OnlineCheckResult> online = checker.checkFiles(
+                    mods.subList(start, Math.min(start + 100, mods.size())),
+                    (hashed, total) -> { if (hashingProgress != null) hashingProgress.accept(offset + hashed, mods.size()); },
+                    stopRequested);
+            for (int i = 0; i < online.size(); i++) {
+                ModScanResult scan = new ModScanResult(mods.get(start + i));
+                if (online.get(i).sha1() == null) {
+                    scan.markError("не удалось прочитать файл и вычислить SHA-1");
+                } else if (online.get(i).confirmed()) {
+                    scan.markOnlineConfirmed();
+                }
+                ModReport report = new ModReport(scan, online.get(i), false);
+                reports.add(report);
+                if (listener != null) {
+                    listener.modScanned(reports.size(), mods.size(), report);
+                }
             }
         }
         return reports;

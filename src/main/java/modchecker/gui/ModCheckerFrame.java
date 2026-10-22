@@ -38,6 +38,7 @@ public final class ModCheckerFrame extends JFrame {
     private final JButton folderButton = new JButton("Папка…");
     private final JButton jarButton = new JButton("JAR…");
     private final JButton scanButton = new JButton("Проверить");
+    private final JButton stopResumeButton = new JButton("Стоп");
     private final JButton sitesButton = new JButton("Быстрая проверка");
     private final JButton fullSelectedButton = new JButton("Полная проверка выбранного");
     private final JButton fullUnconfirmedButton = new JButton("Полная проверка неподтверждённых");
@@ -83,6 +84,10 @@ public final class ModCheckerFrame extends JFrame {
     private volatile boolean scanning;
     private final Function<String, OnlineChecker> checkerFactory;
     private final Path scanSettingsFile;
+    private boolean updatingResults;
+    private ModReport displayedReport;
+    private ScanSession scanSession;
+    private ScanWorker activeScanWorker;
 
     public ModCheckerFrame() { this(OnlineChecker::new); }
     public ModCheckerFrame(Function<String, OnlineChecker> checkerFactory) {
@@ -344,7 +349,12 @@ public final class ModCheckerFrame extends JFrame {
         JPanel panel = new JPanel(new BorderLayout(0, 10));
         panel.add(totalsLabel, BorderLayout.NORTH);
         progressBar.setStringPainted(true); progressBar.setMaximum(1); progressBar.setString("Готов к проверке");
-        panel.add(progressBar);
+        JPanel progress = new JPanel(new BorderLayout(8, 0));
+        progress.add(progressBar);
+        stopResumeButton.setEnabled(false);
+        stopResumeButton.addActionListener(e -> stopOrResume());
+        progress.add(stopResumeButton, BorderLayout.EAST);
+        panel.add(progress);
         panel.add(statusLabel, BorderLayout.SOUTH);
         return panel;
     }
@@ -453,6 +463,7 @@ public final class ModCheckerFrame extends JFrame {
         saveButton.setEnabled(!busy && !reports.isEmpty());
         if (settingsDialog != null) settingsDialog.setVisible(false);
         updateTrustButtons(); updateEmptyState();
+        updateStopResumeButton();
     }
     private void checkNativeFiles() {
         ModReport report = selectedReport();
@@ -658,24 +669,69 @@ public final class ModCheckerFrame extends JFrame {
 
     private void beginScan(List<Path> mods, boolean onlineOnly, boolean replaceExisting) {
         if (scanning || mods.isEmpty()) return;
-        String key = currentKey();
-        if (key.isEmpty()) keyStatusLabel.setText("Ключ не задан — CurseForge пропускается");
-        if (!key.isEmpty() && rememberKeyCheck.isSelected()) {
-            saveKey(key, false);
-        }
         if (!replaceExisting) {
             reports.clear();
+            displayedReport = null;
             tableModel.setReports(List.of());
             detailsArea.setText("");
         }
+        scanSession = new ScanSession(mods, onlineOnly, pathField.getText());
+        startSessionWorker();
+    }
+
+    private static final class ScanSession {
+        private final List<Path> files;
+        private final boolean onlineOnly;
+        private final String path;
+        private int completed;
+        ScanSession(List<Path> files, boolean onlineOnly, String path) {
+            this.files = List.copyOf(files); this.onlineOnly = onlineOnly; this.path = path;
+        }
+    }
+
+    private void startSessionWorker() {
+        ScanSession session = scanSession;
+        if (scanning || session == null || session.completed >= session.files.size()) return;
+        String key = currentKey();
+        if (key.isEmpty()) keyStatusLabel.setText("Ключ не задан — CurseForge пропускается");
+        if (!key.isEmpty() && rememberKeyCheck.isSelected()) saveKey(key, false);
+        activeScanWorker = new ScanWorker(session, checkerFactory.apply(key));
         setBusy(true);
         updateTotals();
-        statusLabel.setText(onlineOnly ? "Сверяю файлы с сайтами..." : unlimitedArchivesCheck.isSelected()
+        statusLabel.setText(session.onlineOnly ? "Сверяю файлы с сайтами..." : unlimitedArchivesCheck.isSelected()
                 ? "Полная статическая проверка — лимиты архивов отключены..." : "Полная статическая проверка...");
-        progressBar.setMaximum(mods.size());
-        progressBar.setValue(0);
-        progressBar.setString("мод 0 из " + mods.size());
-        new ScanWorker(mods, checkerFactory.apply(key), onlineOnly, replaceExisting).execute();
+        progressBar.setMaximum(session.files.size());
+        progressBar.setValue(session.completed);
+        progressBar.setString("мод " + session.completed + " из " + session.files.size());
+        activeScanWorker.execute();
+    }
+
+    private void stopOrResume() {
+        if (activeScanWorker != null) {
+            activeScanWorker.stopRequested = true;
+            statusLabel.setText(activeScanWorker.session.onlineOnly
+                    ? "Останавливаю: завершаю текущую сверку с сайтами..."
+                    : "Останавливаю после текущего файла...");
+            updateStopResumeButton();
+        } else if (!scanning && scanSession != null) {
+            pathField.setText(scanSession.path);
+            modeCombo.setSelectedIndex(scanSession.onlineOnly ? 0 : 1);
+            startSessionWorker();
+        }
+    }
+
+    private void updateStopResumeButton() {
+        if (activeScanWorker != null) {
+            stopResumeButton.setText(activeScanWorker.stopRequested ? "Останавливаю…" : "Стоп");
+            stopResumeButton.setEnabled(!activeScanWorker.stopRequested);
+            stopResumeButton.setToolTipText("Завершить текущий файл или пакет сверки и сохранить оставшуюся очередь");
+        } else {
+            boolean paused = scanSession != null && scanSession.completed < scanSession.files.size();
+            stopResumeButton.setText(paused ? "Продолжить" : "Стоп");
+            stopResumeButton.setEnabled(paused && !scanning);
+            stopResumeButton.setToolTipText(paused ? "Продолжить незавершённую проверку: осталось "
+                    + (scanSession.files.size() - scanSession.completed) + " файлов" : "Остановить текущую проверку");
+        }
     }
 
     private void mergeReport(ModReport report) {
@@ -688,89 +744,101 @@ public final class ModCheckerFrame extends JFrame {
         reports.add(report);
     }
 
+    /** Обновляет строки, не теряя выбранный файл при сортировке и фильтрации. */
+    private void refreshResults(Path preferredFile, boolean forceDetails) {
+        ModReport selected = selectedReport();
+        Path selectedFile = preferredFile != null ? preferredFile : selected != null ? selected.scan().file() : null;
+        updatingResults = true;
+        try {
+            tableModel.setReports(reports);
+            if (selectedFile != null) {
+                for (int row = 0; row < table.getRowCount(); row++) {
+                    if (tableModel.reportAt(table.convertRowIndexToModel(row)).scan().file().equals(selectedFile)) {
+                        table.setRowSelectionInterval(row, row);
+                        break;
+                    }
+                }
+            } else if (table.getRowCount() > 0) {
+                table.setRowSelectionInterval(0, 0);
+            }
+        } finally { updatingResults = false; }
+        showDetails(forceDetails);
+    }
+
     private final class ScanWorker extends SwingWorker<List<ModReport>, ModReport> {
+        private final ScanSession session;
         private final List<Path> mods;
         private final OnlineChecker onlineChecker;
-        private final boolean onlineOnly;
-        private final boolean replaceExisting;
         private final ScanLimits limits;
+        private final int offset;
+        private final List<ModReport> produced = new ArrayList<>();
+        private volatile boolean stopRequested;
         private int completed;
 
-        private ScanWorker(List<Path> mods, OnlineChecker onlineChecker,
-                           boolean onlineOnly, boolean replaceExisting) {
-            this.mods = mods;
+        private ScanWorker(ScanSession session, OnlineChecker onlineChecker) {
+            this.session = session;
+            this.offset = session.completed;
+            this.mods = session.files.subList(offset, session.files.size());
             this.onlineChecker = onlineChecker;
-            this.onlineOnly = onlineOnly;
-            this.replaceExisting = replaceExisting;
             this.limits = currentScanLimits();
         }
 
-        @Override
-        protected List<ModReport> doInBackground() {
-            if (onlineOnly) {
-                return ScanBatch.checkSites(mods, onlineChecker,
-                        (done, total, report) -> publish(report),
-                        (hashed, total) -> SwingUtilities.invokeLater(() -> {
-                            progressBar.setValue(hashed);
-                            progressBar.setString(hashed < total
-                                    ? "Хеши: " + hashed + " из " + total
-                                    : "Сверяю хеши с Modrinth и CurseForge...");
-                        }));
-            }
-            return ScanBatch.scan(mods, onlineChecker,
-                    (done, total, report) -> publish(report), limits);
+        private void reportReady(int done, int total, ModReport report) {
+            produced.add(report);
+            publish(report);
         }
 
-        @Override
-        protected void process(List<ModReport> chunks) {
-            for (ModReport report : chunks) {
-                if (replaceExisting) {
-                    mergeReport(report);
-                } else {
-                    reports.add(report);
-                }
-                completed++;
+        @Override protected List<ModReport> doInBackground() {
+            if (session.onlineOnly) {
+                return ScanBatch.checkSites(mods, onlineChecker, this::reportReady,
+                        (hashed, total) -> SwingUtilities.invokeLater(() -> {
+                            if (activeScanWorker != this) return;
+                            progressBar.setValue(offset + hashed);
+                            progressBar.setString("Хеши: " + (offset + hashed) + " из " + session.files.size());
+                        }), () -> stopRequested);
             }
-            tableModel.setReports(reports);
-            progressBar.setMaximum(mods.size());
-            progressBar.setValue(completed);
-            progressBar.setString("мод " + completed + " из " + mods.size());
+            return ScanBatch.scan(mods, onlineChecker, this::reportReady, limits, () -> stopRequested);
+        }
+
+        @Override protected void process(List<ModReport> chunks) {
+            if (activeScanWorker != this) return;
+            for (ModReport report : chunks) { mergeReport(report); completed++; }
+            refreshResults(null, false);
+            progressBar.setValue(offset + completed);
+            progressBar.setString("мод " + (offset + completed) + " из " + session.files.size());
             updateTotals();
         }
 
-        @Override
-        protected void done() {
+        @Override protected void done() {
+            if (activeScanWorker != this) return;
+            Throwable failure = null;
+            try { get(); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); failure = e; }
+            catch (ExecutionException e) { failure = e.getCause(); }
             try {
-                List<ModReport> all = get();
-                if (!replaceExisting) reports.clear();
-                for (ModReport report : all) mergeReport(report);
-                tableModel.setReports(reports);
-                progressBar.setMaximum(Math.max(1, all.size()));
-                progressBar.setValue(all.size());
-                progressBar.setString("готово: " + all.size() + " мод(ов)");
-                if (onlineChecker.hadNetworkError()) {
+                for (ModReport report : produced) mergeReport(report);
+                session.completed = offset + produced.size();
+                refreshResults(null, false);
+                boolean paused = session.completed < session.files.size();
+                if (!paused) scanSession = null;
+                progressBar.setValue(session.completed);
+                progressBar.setString((paused ? "остановлено: " : "готово: ")
+                        + session.completed + " из " + session.files.size());
+                if (failure != null) {
+                    statusLabel.setText(paused ? "Ошибка; готовые результаты сохранены, можно продолжить" : "Ошибка проверки");
+                    showError("Ошибка проверки: " + message(failure));
+                } else if (paused) {
+                    statusLabel.setText("Проверка остановлена. Осталось файлов: "
+                            + (session.files.size() - session.completed) + ". Нажмите «Продолжить»");
+                } else if (onlineChecker.hadNetworkError()) {
                     statusLabel.setText("Онлайн-проверка частично недоступна; подробности в таблице");
-                } else if (onlineOnly) {
+                } else if (session.onlineOnly) {
                     long pending = reports.stream().filter(ModReport::needsFullScan).count();
-                    statusLabel.setText(pending > 0
-                            ? "Без подтверждения: " + pending + ". Доступна полная проверка"
+                    statusLabel.setText(pending > 0 ? "Без подтверждения: " + pending + ". Доступна полная проверка"
                             : "Сверка завершена. Анализ кода не выполнялся");
-                } else {
-                    statusLabel.setText("Полная проверка завершена");
-                }
-                if (replaceExisting && !all.isEmpty()) {
-                    refreshSelection(all.get(0).scan().file());
-                } else if (table.getRowCount() > 0) {
-                    table.setRowSelectionInterval(0, 0);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                statusLabel.setText("проверка прервана");
-            } catch (ExecutionException e) {
-                statusLabel.setText("ошибка");
-                progressBar.setString("ошибка");
-                showError("Ошибка проверки: " + message(e.getCause()));
+                } else statusLabel.setText("Полная проверка завершена");
             } finally {
+                activeScanWorker = null;
                 setBusy(false);
                 updateTotals();
                 updateTrustButtons();
@@ -786,8 +854,13 @@ public final class ModCheckerFrame extends JFrame {
                 && reports.stream().anyMatch(ModReport::needsFullScan));
     }
     private void showDetails() {
+        showDetails(false);
+    }
+    private void showDetails(boolean force) {
+        if (updatingResults) return;
         int viewRow = table.getSelectedRow();
         if (viewRow < 0) {
+            displayedReport = null;
             detailsArea.setText("");
             updateTrustButtons();
             return;
@@ -795,6 +868,8 @@ public final class ModCheckerFrame extends JFrame {
 
         int modelRow = table.convertRowIndexToModel(viewRow);
         ModReport report = tableModel.reportAt(modelRow);
+        if (!force && report == displayedReport) { updateTrustButtons(); return; }
+        displayedReport = report;
         detailsArea.setText(ReportPrinter.formatMod(report).stripLeading());
         detailsArea.setCaretPosition(0);
         updateTrustButtons();
@@ -869,17 +944,9 @@ public final class ModCheckerFrame extends JFrame {
     }
 
     private void refreshSelection(Path selectedFile) {
-        tableModel.setReports(reports);
-        for (int viewRow = 0; viewRow < table.getRowCount(); viewRow++) {
-            int modelRow = table.convertRowIndexToModel(viewRow);
-            if (tableModel.reportAt(modelRow).scan().file().equals(selectedFile)) {
-                table.setRowSelectionInterval(viewRow, viewRow);
-                break;
-            }
-        }
+        refreshResults(selectedFile, true);
         updateTotals();
         updateTrustButtons();
-        showDetails();
     }
 
     private ModReport selectedReport() {

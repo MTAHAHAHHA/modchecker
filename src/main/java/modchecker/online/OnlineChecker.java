@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * Проверка SHA-1 и отпечатка CurseForge через официальные API.
@@ -93,9 +94,17 @@ public final class OnlineChecker {
     /** Только чтение и хеширование файлов; архивы и байткод не разбираются. */
     public List<OnlineCheckResult> checkFiles(List<Path> files,
                                              BiConsumer<Integer, Integer> hashingProgress) {
+        return checkFiles(files, hashingProgress, () -> false);
+    }
+
+    /** Уже прочитанный пакет завершается, последующие файлы можно продолжить отдельно. */
+    public List<OnlineCheckResult> checkFiles(List<Path> files,
+                                             BiConsumer<Integer, Integer> hashingProgress,
+                                             BooleanSupplier stopRequested) {
         List<FileHash> hashes = new ArrayList<>();
         boolean useCurseForge = curseForgeKey != null && !curseForgeKey.isBlank();
         for (int i = 0; i < files.size(); i++) {
+            if (stopRequested.getAsBoolean()) break;
             String sha1 = null;
             Long fingerprint = null;
             try {
@@ -115,6 +124,7 @@ public final class OnlineChecker {
         List<OnlineCheckResult> results = new ArrayList<>();
         // Пакетные запросы вместо двух сетевых запросов на каждый мод.
         for (int start = 0; start < hashes.size(); start += 100) {
+            if (start > 0 && stopRequested.getAsBoolean()) break;
             List<FileHash> batch = hashes.subList(start, Math.min(start + 100, hashes.size()));
             Map<String, OnlineStatus> modrinth = checkModrinthBatch(batch);
             Map<String, OnlineStatus> curseForge = checkCurseForgeBatch(batch);
