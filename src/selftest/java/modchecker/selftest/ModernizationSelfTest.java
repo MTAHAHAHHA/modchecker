@@ -3,6 +3,8 @@ package modchecker.selftest;
 import com.google.gson.*;
 import com.sun.net.httpserver.HttpServer;
 import modchecker.gui.ResultFilters;
+import modchecker.app.ScanBatch;
+import modchecker.app.ScanSettings;
 import modchecker.model.*;
 import modchecker.online.*;
 import modchecker.report.*;
@@ -66,6 +68,50 @@ public final class ModernizationSelfTest {
         Thread.currentThread().interrupt();
         try { require(new ScanService().scan(jar).hasError(), "прерванная проверка выглядит успешной"); }
         finally { Thread.interrupted(); }
+    }
+
+    public static void scanPreferences(Path temp) throws Exception {
+        Path settings = Files.createTempDirectory(temp, "scan-settings").resolve("settings.properties");
+        require(!ScanSettings.load(settings).unlimitedArchives(), "лимиты отключены без выбора пользователя");
+        new ScanSettings(true).save(settings);
+        require(ScanSettings.load(settings).limits().equals(ScanLimits.UNLIMITED), "выбор не сохранён");
+        new ScanSettings(false).save(settings);
+        require(ScanSettings.load(settings).limits().equals(ScanLimits.DEFAULT), "обычные лимиты не восстановлены");
+        Files.writeString(settings, "unlimitedArchives=invalid\n");
+        require(!ScanSettings.load(settings).unlimitedArchives(), "повреждённое значение отключило лимиты");
+    }
+
+    public static void unlimitedArchives(Path temp, Path extra) throws Exception {
+        for (String kind : List.of("entry", "total", "count", "class", "nested")) {
+            require(!new ScanService(ScanLimits.UNLIMITED).scan(temp.resolve("limit-" + kind + ".jar")).hasError(),
+                    "остался ресурсный лимит: " + kind);
+        }
+        ScanLimits.UNLIMITED.checkTime(System.nanoTime() - 121_000_000_000L);
+        boolean interrupted = false;
+        Thread.currentThread().interrupt();
+        try { ScanLimits.UNLIMITED.checkTime(System.nanoTime()); }
+        catch (ScanLimitException e) { interrupted = true; }
+        finally { Thread.interrupted(); }
+        require(interrupted, "режим без лимитов игнорирует прерывание");
+        var rat = new ScanService(ScanLimits.UNLIMITED).scan(extra.resolve("fake_visual_rat.jar"));
+        require(rat.verdict() == Verdict.DANGEROUS && rat.points() == 21, "изменено обнаружение RAT без лимитов");
+        require(ScanLimits.UNLIMITED.maxNestedDepth() == ScanLimits.DEFAULT.maxNestedDepth(), "изменена глубина анализа");
+    }
+
+    public static void propagatedLimits(Path temp) throws Exception {
+        var limits = new ScanLimits(100, 1024, 100_000, 2, 10_000, 1024);
+        Path jar = temp.resolve("limit-entry.jar");
+        try (var sites = new QuickCheckSelfTest.Sites()) {
+            require(ScanBatch.scan(List.of(jar), sites.checker(""), null, limits).get(0).scan().hasError(), "пакетная проверка потеряла лимит");
+            require(!ScanBatch.scan(List.of(jar), sites.checker(""), null, ScanLimits.UNLIMITED).get(0).scan().hasError(), "пакетная проверка не снимает лимит");
+        }
+        Path nativeJar = temp.resolve("limit-native.jar");
+        Files.write(nativeJar, zip(Map.of("test.dll", new byte[4096])));
+        boolean rejected = false;
+        try { NativeFileScanner.collect(nativeJar, limits); }
+        catch (ScanLimitException e) { rejected = true; }
+        require(rejected, "хеширование нативных файлов потеряло лимит");
+        require(NativeFileScanner.collect(nativeJar, ScanLimits.UNLIMITED).get(0).size() == 4096, "хеширование нативных файлов не снимает лимит");
     }
 
     public static void nativeFiles(Path temp) throws Exception {

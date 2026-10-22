@@ -1,11 +1,13 @@
 package modchecker.gui;
 
 import modchecker.app.ScanBatch;
+import modchecker.app.ScanSettings;
 import modchecker.model.Verdict;
 import modchecker.online.*;
 import modchecker.report.*;
 import modchecker.scan.ModFinder;
 import modchecker.scan.NativeFileScanner;
+import modchecker.scan.ScanLimits;
 import modchecker.trust.TrustedHashes;
 import javax.swing.*;
 import javax.swing.event.DocumentEvent;
@@ -67,6 +69,7 @@ public final class ModCheckerFrame extends JFrame {
     private final JButton deleteKeyButton = new JButton("Удалить");
     private final JLabel keyStatusLabel = new JLabel("Ключ не задан — CurseForge пропускается");
     private final JPasswordField vtKeyField = new JPasswordField(24);
+    private final JCheckBox unlimitedArchivesCheck = new JCheckBox("Снять ограничения проверки архивов");
     private final JLabel vtStatusLabel = new JLabel("Проверка доступна в меню «Действия» выбранного мода");
     private final JToggleButton detailsToggle = new JToggleButton("Подробности  ▾", true);
     private final CardLayout resultCards = new CardLayout();
@@ -79,11 +82,17 @@ public final class ModCheckerFrame extends JFrame {
     private final List<ModReport> reports = new ArrayList<>();
     private volatile boolean scanning;
     private final Function<String, OnlineChecker> checkerFactory;
+    private final Path scanSettingsFile;
 
     public ModCheckerFrame() { this(OnlineChecker::new); }
     public ModCheckerFrame(Function<String, OnlineChecker> checkerFactory) {
+        this(checkerFactory, ScanSettings.defaultFile());
+    }
+    public ModCheckerFrame(Function<String, OnlineChecker> checkerFactory, Path scanSettingsFile) {
         super("ModChecker 1.2");
         this.checkerFactory = checkerFactory;
+        this.scanSettingsFile = scanSettingsFile;
+        unlimitedArchivesCheck.setSelected(ScanSettings.load(scanSettingsFile).unlimitedArchives());
         ThemeManager.ensureInstalled();
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         Rectangle screen = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
@@ -374,6 +383,15 @@ public final class ModCheckerFrame extends JFrame {
             themes.setSelectedIndex(ThemeManager.isDark() ? 0 : 1);
             themes.addActionListener(e -> ThemeManager.apply(themes.getSelectedIndex() == 0, true));
             theme.add(themes); content.add(theme); content.add(Box.createVerticalStrut(12));
+            JPanel limits = new JPanel(new BorderLayout(0, 8));
+            limits.setBorder(BorderFactory.createTitledBorder("Проверка архивов"));
+            limits.add(unlimitedArchivesCheck, BorderLayout.NORTH);
+            limits.add(new JLabel("<html>Отключает лимиты размера, количества файлов и времени.<br>Большие архивы могут потребовать больше памяти и времени.<br>Разбор вложенных JAR: до двух уровней.</html>"));
+            unlimitedArchivesCheck.addActionListener(e -> {
+                try { new ScanSettings(unlimitedArchivesCheck.isSelected()).save(scanSettingsFile); }
+                catch (IOException ex) { statusLabel.setText("Настройки действуют до закрытия окна: сохранить их не удалось"); }
+            });
+            content.add(limits); content.add(Box.createVerticalStrut(12));
             content.add(buildKeyPanel()); content.add(Box.createVerticalStrut(16));
             JPanel vt = new JPanel(new BorderLayout(8, 10));
             vt.setBorder(BorderFactory.createTitledBorder("VirusTotal · нативные файлы"));
@@ -399,7 +417,18 @@ public final class ModCheckerFrame extends JFrame {
             JPanel bottom = new JPanel(new FlowLayout(FlowLayout.RIGHT));
             JButton close = new JButton("Готово"); close.addActionListener(e -> settingsDialog.setVisible(false)); bottom.add(close);
             settingsDialog.add(new JScrollPane(content)); settingsDialog.add(bottom, BorderLayout.SOUTH);
-            settingsDialog.setMinimumSize(new Dimension(680, 520)); settingsDialog.setSize(740, 570);
+            Rectangle screen = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
+            settingsDialog.setMinimumSize(new Dimension(Math.min(760, screen.width), Math.min(620, screen.height)));
+            SwingUtilities.updateComponentTreeUI(settingsDialog);
+            for (Component child : content.getComponents()) {
+                if (child instanceof JComponent component) {
+                    component.setAlignmentX(Component.LEFT_ALIGNMENT);
+                    component.setMaximumSize(new Dimension(Integer.MAX_VALUE, component.getPreferredSize().height));
+                }
+            }
+            settingsDialog.pack();
+            settingsDialog.setSize(Math.min(screen.width, Math.max(840, settingsDialog.getWidth())),
+                    Math.min(screen.height, Math.max(760, settingsDialog.getHeight())));
         }
     }
 
@@ -429,12 +458,13 @@ public final class ModCheckerFrame extends JFrame {
         ModReport report = selectedReport();
         if (report == null || scanning) return;
         String key = new String(vtKeyField.getPassword()).trim();
+        ScanLimits limits = currentScanLimits();
         setBusy(true); progressBar.setIndeterminate(true); statusLabel.setText("Читаю нативные файлы и сверяю SHA-256 с VirusTotal…");
         new SwingWorker<ModReport, Void>() {
             @Override protected ModReport doInBackground() throws Exception {
                 String before = Hashes.sha1(report.scan().file());
                 if (!before.equals(report.online().sha1())) throw new IOException("Файл изменён после проверки; проверьте его заново");
-                var files = NativeFileScanner.collect(report.scan().file());
+                var files = NativeFileScanner.collect(report.scan().file(), limits);
                 var client = new VirusTotalClient(key);
                 List<NativeFileReport> results = new ArrayList<>();
                 for (var file : files) results.add(new NativeFileReport(file, client.check(file.sha256())));
@@ -574,6 +604,10 @@ public final class ModCheckerFrame extends JFrame {
         startPathScan(false);
     }
 
+    private ScanLimits currentScanLimits() {
+        return new ScanSettings(unlimitedArchivesCheck.isSelected()).limits();
+    }
+
     public void startOnlineCheck() {
         startPathScan(true);
     }
@@ -636,7 +670,8 @@ public final class ModCheckerFrame extends JFrame {
         }
         setBusy(true);
         updateTotals();
-        statusLabel.setText(onlineOnly ? "Сверяю файлы с сайтами..." : "Полная статическая проверка...");
+        statusLabel.setText(onlineOnly ? "Сверяю файлы с сайтами..." : unlimitedArchivesCheck.isSelected()
+                ? "Полная статическая проверка — лимиты архивов отключены..." : "Полная статическая проверка...");
         progressBar.setMaximum(mods.size());
         progressBar.setValue(0);
         progressBar.setString("мод 0 из " + mods.size());
@@ -658,6 +693,7 @@ public final class ModCheckerFrame extends JFrame {
         private final OnlineChecker onlineChecker;
         private final boolean onlineOnly;
         private final boolean replaceExisting;
+        private final ScanLimits limits;
         private int completed;
 
         private ScanWorker(List<Path> mods, OnlineChecker onlineChecker,
@@ -666,6 +702,7 @@ public final class ModCheckerFrame extends JFrame {
             this.onlineChecker = onlineChecker;
             this.onlineOnly = onlineOnly;
             this.replaceExisting = replaceExisting;
+            this.limits = currentScanLimits();
         }
 
         @Override
@@ -681,7 +718,7 @@ public final class ModCheckerFrame extends JFrame {
                         }));
             }
             return ScanBatch.scan(mods, onlineChecker,
-                    (done, total, report) -> publish(report));
+                    (done, total, report) -> publish(report), limits);
         }
 
         @Override
@@ -743,7 +780,8 @@ public final class ModCheckerFrame extends JFrame {
 
     private void updateFullButtons() {
         ModReport selected = selectedReport();
-        fullSelectedButton.setEnabled(!scanning && selected != null && !selected.fullScan());
+        fullSelectedButton.setEnabled(!scanning && selected != null
+                && (!selected.fullScan() || selected.scan().hasError()));
         fullUnconfirmedButton.setEnabled(!scanning
                 && reports.stream().anyMatch(ModReport::needsFullScan));
     }

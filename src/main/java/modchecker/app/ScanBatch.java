@@ -5,6 +5,7 @@ import modchecker.online.OnlineCheckResult;
 import modchecker.online.OnlineChecker;
 import modchecker.report.ModReport;
 import modchecker.scan.ScanService;
+import modchecker.scan.ScanLimits;
 import modchecker.trust.TrustedHashes;
 
 import java.io.IOException;
@@ -29,7 +30,12 @@ public final class ScanBatch {
 
     public static List<ModReport> scan(List<Path> mods, OnlineChecker onlineChecker,
                                        Listener listener) {
-        ScanService scanner = new ScanService();
+        return scan(mods, onlineChecker, listener, ScanLimits.DEFAULT);
+    }
+
+    public static List<ModReport> scan(List<Path> mods, OnlineChecker onlineChecker,
+                                       Listener listener, ScanLimits limits) {
+        ScanService scanner = new ScanService(limits);
         List<ModReport> reports = new ArrayList<>();
 
         for (int i = 0; i < mods.size(); i++) {

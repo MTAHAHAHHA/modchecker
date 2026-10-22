@@ -101,7 +101,7 @@ final class JarWalker {
     private static final class Budget {
         private final ScanLimits limits;
         private final long started;
-        private int entries;
+        private long entries;
         private long expanded;
 
         Budget(ScanLimits limits, long started) { this.limits = limits; this.started = started; }

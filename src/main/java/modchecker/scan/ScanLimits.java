@@ -5,6 +5,10 @@ public record ScanLimits(int maxEntries, long maxEntryBytes, long maxTotalBytes,
                          int maxNestedDepth, long maxDurationMillis, long maxClassBytes) {
     public static final ScanLimits DEFAULT = new ScanLimits(
             75_000, 64L << 20, 512L << 20, 2, 120_000, 8L << 20);
+    /** Без прикладных лимитов ресурсов; глубина анализа и обработка прерывания сохранены. */
+    public static final ScanLimits UNLIMITED = new ScanLimits(
+            Integer.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE,
+            DEFAULT.maxNestedDepth(), Long.MAX_VALUE, Long.MAX_VALUE);
 
     public ScanLimits {
         if (maxEntries < 1 || maxEntryBytes < 1 || maxTotalBytes < 1

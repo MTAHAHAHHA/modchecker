@@ -1007,6 +1007,9 @@ public final class SelfTest {
             check("Ограничения архива: " + kind, () -> ModernizationSelfTest.limits(tempDir, kind));
         }
         check("Ограничения: время и прерывание дают ошибку", () -> ModernizationSelfTest.timeLimit(tempDir));
+        check("Настройки: сохранение и восстановление лимитов", () -> ModernizationSelfTest.scanPreferences(tempDir));
+        check("Без лимитов: большие записи, время и сохранение RAT", () -> ModernizationSelfTest.unlimitedArchives(tempDir, extraDir));
+        check("Лимиты: передача в полную проверку и хеширование нативных файлов", () -> ModernizationSelfTest.propagatedLimits(tempDir));
         check("Нативные файлы: только чтение, SHA-256 и вложенные пути", () -> ModernizationSelfTest.nativeFiles(tempDir));
         check("VirusTotal: GET и постоянный кэш", () -> ModernizationSelfTest.vtFound(tempDir));
         check("VirusTotal: нет данных, нет ключа, истечение кэша", () -> ModernizationSelfTest.vtMissing(tempDir));

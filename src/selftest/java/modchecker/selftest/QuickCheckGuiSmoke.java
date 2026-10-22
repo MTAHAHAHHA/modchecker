@@ -2,6 +2,7 @@ package modchecker.selftest;
 
 import modchecker.gui.ModCheckerFrame;
 import modchecker.gui.ThemeManager;
+import modchecker.app.ScanSettings;
 import modchecker.model.Verdict;
 import modchecker.online.Hashes;
 import javax.swing.*;
@@ -27,10 +28,12 @@ public final class QuickCheckGuiSmoke {
         try (var sites = new QuickCheckSelfTest.Sites()) {
             sites.modrinth.add(Hashes.sha1(clean));
             SwingUtilities.invokeAndWait(() -> {
-                var frame = new ModCheckerFrame(key -> sites.checker(""));
+                var frame = new ModCheckerFrame(key -> sites.checker(""), dir.resolve("scan-settings.properties"));
                 reference.set(frame);
                 field(frame, "rememberKeyCheck", JCheckBox.class).setSelected(false);
                 field(frame, "keyField", JPasswordField.class).setText("");
+                field(frame, "vtKeyField", JPasswordField.class).setText("");
+                field(frame, "unlimitedArchivesCheck", JCheckBox.class).setSelected(false);
                 frame.setPath(dir.toAbsolutePath().toString());
                 frame.pack();
                 frame.setSize(1100, 760);
@@ -70,6 +73,7 @@ public final class QuickCheckGuiSmoke {
             assertUpgraded(reference.get());
             System.out.println("[OK] GUI: полная проверка неподтверждённых; подтверждённый мод не анализировался");
             SwingUtilities.invokeAndWait(() -> modernUi(reference.get(), dir));
+            checkArchiveLimits(reference.get(), dir);
             SwingUtilities.invokeAndWait(() -> {
                 field(reference.get(), "modeCombo", JComboBox.class).setSelectedIndex(1);
                 field(reference.get(), "scanButton", JButton.class).doClick();
@@ -83,6 +87,32 @@ public final class QuickCheckGuiSmoke {
                 for (var window : java.awt.Window.getWindows()) window.dispose();
             });
         }
+    }
+
+    private static void checkArchiveLimits(ModCheckerFrame frame, Path dir) throws Exception {
+        Path archive = Files.createDirectories(dir.resolveSibling(dir.getFileName() + "-limits")).resolve("large-class.jar");
+        try (var out = new java.util.zip.ZipOutputStream(Files.newOutputStream(archive))) {
+            out.putNextEntry(new java.util.zip.ZipEntry("Large.class"));
+            out.write(new byte[(8 << 20) + 1]);
+            out.closeEntry();
+        }
+        SwingUtilities.invokeAndWait(() -> { frame.setPath(archive.toString()); frame.startScan(); });
+        await(frame);
+        SwingUtilities.invokeAndWait(() -> {
+            require(frame.getReports().get(0).scan().hasError(), "лимит класса по умолчанию не работает");
+            field(frame, "unlimitedArchivesCheck", JCheckBox.class).doClick();
+            require(ScanSettings.load(dir.resolve("scan-settings.properties")).unlimitedArchives(), "не сохранён выбор без лимитов");
+            JButton retry = field(frame, "fullSelectedButton", JButton.class);
+            require(retry.isEnabled(), "нельзя повторить проверку файла после снятия лимита");
+            retry.doClick();
+        });
+        await(frame);
+        SwingUtilities.invokeAndWait(() -> {
+            require(!frame.getReports().get(0).scan().hasError(), "переключатель не передан в фоновую проверку");
+            field(frame, "unlimitedArchivesCheck", JCheckBox.class).doClick();
+            frame.setPath(dir.toString());
+        });
+        System.out.println("[OK] GUI: отключение лимитов сохраняется и применяется при проверке");
     }
 
     private static void modernUi(ModCheckerFrame frame, Path dir) {
@@ -110,6 +140,12 @@ public final class QuickCheckGuiSmoke {
             var dialog = field(frame, "settingsDialog", JDialog.class);
             require(SwingUtilities.isDescendingFrom(field(frame, "keyField", JPasswordField.class), dialog)
                     && SwingUtilities.isDescendingFrom(field(frame, "vtKeyField", JPasswordField.class), dialog), "ключи не в отдельном окне");
+            var screen = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
+            require(dialog.getWidth() >= Math.min(840, screen.width) && dialog.getHeight() >= Math.min(760, screen.height),
+                    "окно настроек по-прежнему открывается маленьким");
+            require(SwingUtilities.isDescendingFrom(field(frame, "unlimitedArchivesCheck", JCheckBox.class), dialog), "нет переключателя лимитов в настройках");
+            dialog.validate();
+            snapshot(dialog, dir.resolve("settings-window.png"));
         } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
         System.out.println("[OK] GUI: настройки ключей находятся в отдельном окне");
         boolean originalDark = ThemeManager.isDark();
@@ -129,7 +165,7 @@ public final class QuickCheckGuiSmoke {
         ThemeManager.apply(originalDark, false);
         System.out.println("[OK] GUI: светлая/тёмная темы и минимальный размер окна");
     }
-    private static void snapshot(ModCheckerFrame frame, Path path) {
+    private static void snapshot(RootPaneContainer frame, Path path) {
         var image = new BufferedImage(frame.getContentPane().getWidth(), frame.getContentPane().getHeight(), BufferedImage.TYPE_INT_RGB);
         var graphics = image.createGraphics(); frame.getContentPane().printAll(graphics); graphics.dispose();
         try { ImageIO.write(image, "png", path.toFile()); }
