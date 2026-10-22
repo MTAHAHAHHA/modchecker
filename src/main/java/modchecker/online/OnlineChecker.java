@@ -31,7 +31,7 @@ import java.util.function.BooleanSupplier;
  */
 public final class OnlineChecker {
 
-    public static final String USER_AGENT = "modchecker/1.2";
+    public static final String USER_AGENT = "modchecker/1.3";
 
     private static final URI MODRINTH_URI =
             URI.create("https://api.modrinth.com/v2/version_files");

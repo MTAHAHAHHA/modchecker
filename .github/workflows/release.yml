@@ -32,7 +32,9 @@ jobs:
           $releaseVersion = $env:GITHUB_REF_NAME.Substring(1)
           $assets = @(Get-ChildItem -LiteralPath "build/release/$releaseVersion" -File | ForEach-Object FullName)
           if ($assets.Count -ne 4) { throw 'Expected exactly four release files' }
-          gh release create $env:GITHUB_REF_NAME @assets --repo $env:GITHUB_REPOSITORY --verify-tag --title "ModChecker $releaseVersion" --generate-notes
+          $notesFile = "docs/releases/$env:GITHUB_REF_NAME.md"
+          $notesArguments = if (Test-Path -LiteralPath $notesFile -PathType Leaf) { @('--notes-file', $notesFile) } else { @('--generate-notes') }
+          gh release create $env:GITHUB_REF_NAME @assets --repo $env:GITHUB_REPOSITORY --verify-tag --title "ModChecker $releaseVersion" --latest @notesArguments
           if ($LASTEXITCODE -ne 0) { throw 'Release creation failed; existing releases are never overwritten' }
       - name: Verify public download checksums
         shell: pwsh

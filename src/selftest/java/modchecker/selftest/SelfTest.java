@@ -1022,7 +1022,7 @@ public final class SelfTest {
         check("Представление: фильтры и JSON не меняют находки", ModernizationSelfTest::filtersAndExport);
         check("Murmur2: потоковый отпечаток совпадает с исходным", () -> ModernizationSelfTest.streamingHash(tempDir));
         check("Modrinth: разбор ответа и User-Agent", () -> {
-            require(OnlineChecker.USER_AGENT.equals("modchecker/1.2"),
+            require(OnlineChecker.USER_AGENT.equals("modchecker/1.3"),
                     "неверный User-Agent для Modrinth");
             require(OnlineChecker.parseModrinthResponse(
                             "abc", "{\"abc\":{\"id\":\"version\"}}")

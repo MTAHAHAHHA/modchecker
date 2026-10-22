@@ -94,7 +94,7 @@ public final class ModCheckerFrame extends JFrame {
         this(checkerFactory, ScanSettings.defaultFile());
     }
     public ModCheckerFrame(Function<String, OnlineChecker> checkerFactory, Path scanSettingsFile) {
-        super("ModChecker 1.2");
+        super("ModChecker 1.3");
         this.checkerFactory = checkerFactory;
         this.scanSettingsFile = scanSettingsFile;
         unlimitedArchivesCheck.setSelected(ScanSettings.load(scanSettingsFile).unlimitedArchives());
