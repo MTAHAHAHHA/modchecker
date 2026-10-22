@@ -17,7 +17,7 @@ import java.util.List;
 public final class ModTableModel extends AbstractTableModel {
 
     private static final String[] COLUMNS = {
-            "Мод", "Вердикт", "Очки", "Modrinth", "CurseForge"
+            "Мод", "Результат", "Очки", "Modrinth", "CurseForge"
     };
 
     private final List<ModReport> reports = new ArrayList<>();
@@ -72,8 +72,8 @@ public final class ModTableModel extends AbstractTableModel {
         ModReport report = reports.get(rowIndex);
         return switch (columnIndex) {
             case 0 -> report.scan().name();
-            case 1 -> report.scan().verdict().label();
-            case 2 -> report.scan().points();
+            case 1 -> report.statusLabel();
+            case 2 -> report.fullScan() ? report.scan().points() : null;
             case 3 -> report.online().modrinth().label();
             case 4 -> report.online().curseForge().label();
             default -> "";
@@ -97,9 +97,9 @@ public final class ModTableModel extends AbstractTableModel {
         return switch (label) {
             case "ОПАСНО" -> 0;
             case "ПОДОЗРИТЕЛЬНО" -> 1;
-            case "НЕИЗВЕСТНО" -> 2;
+            case "НЕИЗВЕСТНО", "НЕ НАЙДЕН НА САЙТАХ", "НЕТ ПОДТВЕРЖДЕНИЯ", "ПРОВЕРКА НЕДОСТУПНА" -> 2;
             case "ДОВЕРЕН (вручную)" -> 3;
-            case "ОК" -> 4;
+            case "ОК", "ПОДТВЕРЖДЁН НА САЙТЕ" -> 4;
             case "ОШИБКА" -> 5;
             default -> 99;
         };

@@ -65,10 +65,14 @@ public final class ReportPrinter {
 
         out.println();
         out.println("=== " + scan.name() + " ===");
-        out.println("Вердикт: " + scan.verdict().label());
-        out.println("Очки: " + scan.points()
-                + " (находки " + scan.findingPoints()
-                + " + связки " + scan.linkPoints() + ")");
+        out.println((report.fullScan() ? "Вердикт: " : "Результат: ") + report.statusLabel());
+        if (report.fullScan()) {
+            out.println("Очки: " + scan.points()
+                    + " (находки " + scan.findingPoints()
+                    + " + связки " + scan.linkPoints() + ")");
+        } else {
+            out.println("Режим: проверка на сайтах. Код мода не анализировался.");
+        }
         if (scan.isManuallyTrusted()) {
             out.println("Доверие: вручную - " + scan.trustSource());
         }
@@ -81,6 +85,12 @@ public final class ReportPrinter {
             return;
         }
 
+        if (!report.fullScan()) {
+            out.println(online.confirmed()
+                    ? "Файл совпал с опубликованной версией. Полная проверка не выполнялась."
+                    : "Подтверждение не получено. Выполните полную проверку; отсутствие на сайте не доказывает вредоносность.");
+            return;
+        }
         if (scan.findings().isEmpty()) {
             out.println("Находки: нет");
         } else {
@@ -173,9 +183,18 @@ public final class ReportPrinter {
         int findings = 0;
         int links = 0;
         int totalPoints = 0;
+        int siteOnly = 0;
+        int siteConfirmed = 0;
+        int siteErrors = 0;
 
         for (ModReport report : reports) {
             ModScanResult scan = report.scan();
+            if (!report.fullScan()) {
+                siteOnly++;
+                if (report.online().confirmed()) siteConfirmed++;
+                if (scan.hasError()) siteErrors++;
+                continue;
+            }
             Verdict verdict = scan.verdict();
             if (verdict == Verdict.DANGEROUS) {
                 dangerous++;
@@ -199,6 +218,14 @@ public final class ReportPrinter {
         out.println();
         out.println("=== ИТОГО ===");
         out.println("Проверено модов: " + reports.size());
+        if (siteOnly > 0) {
+            out.println("Проверка на сайтах без анализа кода: " + siteOnly);
+            out.println("Подтверждено на сайтах: " + siteConfirmed);
+            out.println("Без подтверждения: " + (siteOnly - siteConfirmed - siteErrors));
+            out.println("Ошибок чтения: " + siteErrors);
+            if (siteOnly == reports.size()) return;
+            out.println("Результаты полной проверки:");
+        }
         out.println("ОПАСНО: " + dangerous);
         out.println("ПОДОЗРИТЕЛЬНО: " + suspicious);
         out.println("НЕИЗВЕСТНО: " + unknown);

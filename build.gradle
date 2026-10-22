@@ -122,6 +122,16 @@ tasks.register('guiSmoke', JavaExec) {
             '-Dstderr.encoding=UTF-8'
 }
 
+tasks.register('quickGuiSmoke', JavaExec) {
+    group = 'verification'
+    description = 'Проверяет быструю и полную проверку в скрытом GUI на локальном HTTP-сервере.'
+    dependsOn tasks.named('buildTestMods')
+    classpath = sourceSets.selftest.runtimeClasspath
+    mainClass = 'modchecker.selftest.QuickCheckGuiSmoke'
+    args testModsDir.get().asFile.absolutePath,
+            testModsExtraDir.get().asFile.absolutePath,
+            layout.buildDirectory.dir('quick-gui-smoke').get().asFile.absolutePath
+}
 tasks.named('check') {
     dependsOn tasks.named('selfTest')
 }

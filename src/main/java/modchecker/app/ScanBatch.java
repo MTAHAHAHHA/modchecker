@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BiConsumer;
 
 /**
  * Общий проход по списку модов: сканирование файла и онлайн-проверка.
@@ -44,6 +45,28 @@ public final class ScanBatch {
             }
         }
 
+        return reports;
+    }
+
+    /** Сверка с сайтами без ScanService, JarWalker и ASM. */
+    public static List<ModReport> checkSites(List<Path> mods, OnlineChecker checker,
+                                             Listener listener,
+                                             BiConsumer<Integer, Integer> hashingProgress) {
+        List<OnlineCheckResult> online = checker.checkFiles(mods, hashingProgress);
+        List<ModReport> reports = new ArrayList<>();
+        for (int i = 0; i < mods.size(); i++) {
+            ModScanResult scan = new ModScanResult(mods.get(i));
+            if (online.get(i).sha1() == null) {
+                scan.markError("не удалось прочитать файл и вычислить SHA-1");
+            } else if (online.get(i).confirmed()) {
+                scan.markOnlineConfirmed();
+            }
+            ModReport report = new ModReport(scan, online.get(i), false);
+            reports.add(report);
+            if (listener != null) {
+                listener.modScanned(i + 1, mods.size(), report);
+            }
+        }
         return reports;
     }
 

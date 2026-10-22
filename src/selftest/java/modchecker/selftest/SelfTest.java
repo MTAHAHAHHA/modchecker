@@ -995,6 +995,14 @@ public final class SelfTest {
                     "подтверждение сайта должно переводить 7 очков в ОК");
         });
 
+        check("Быстрая проверка: пакеты, порядок и точное совпадение SHA-1", () ->
+                QuickCheckSelfTest.batches(tempDir));
+        check("Быстрая проверка: нет ключа, сбой сайта и нечитаемый файл", () ->
+                QuickCheckSelfTest.failures(tempDir));
+        check("Быстрая проверка: полная проверка по-прежнему обнаруживает RAT", () ->
+                QuickCheckSelfTest.fullScan(extraDir));
+        check("Быстрая проверка: таблица и отчёт не обещают анализ кода", () ->
+                QuickCheckSelfTest.presentation());
         check("Modrinth: разбор ответа и User-Agent", () -> {
             require(OnlineChecker.USER_AGENT.equals("modchecker/1.2"),
                     "неверный User-Agent для Modrinth");
@@ -1233,7 +1241,7 @@ public final class SelfTest {
             ));
 
             require(model.getColumnName(0).equals("Мод")
-                            && model.getColumnName(1).equals("Вердикт")
+                            && model.getColumnName(1).equals("Результат")
                             && model.getColumnName(2).equals("Очки")
                             && model.getColumnName(3).equals("Modrinth")
                             && model.getColumnName(4).equals("CurseForge"),

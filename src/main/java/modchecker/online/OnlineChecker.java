@@ -16,6 +16,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.function.BiConsumer;
 
 /**
  * Проверка SHA-1 и отпечатка CurseForge через официальные API.
@@ -74,12 +79,179 @@ public final class OnlineChecker {
                 .build();
     }
 
-    private OnlineChecker(HttpClient http, String curseForgeKey,
+    public OnlineChecker(HttpClient http, String curseForgeKey,
                           URI modrinthUri, URI curseForgeUri) {
         this.http = http;
         this.curseForgeKey = curseForgeKey;
         this.modrinthUri = modrinthUri;
         this.curseForgeUri = curseForgeUri;
+    }
+
+    private record FileHash(String sha1, Long fingerprint) {
+    }
+
+    /** Только чтение и хеширование файлов; архивы и байткод не разбираются. */
+    public List<OnlineCheckResult> checkFiles(List<Path> files,
+                                             BiConsumer<Integer, Integer> hashingProgress) {
+        List<FileHash> hashes = new ArrayList<>();
+        boolean useCurseForge = curseForgeKey != null && !curseForgeKey.isBlank();
+        for (int i = 0; i < files.size(); i++) {
+            String sha1 = null;
+            Long fingerprint = null;
+            try {
+                sha1 = Hashes.sha1(files.get(i));
+                if (useCurseForge) {
+                    fingerprint = Hashes.curseForgeFingerprint(files.get(i));
+                }
+            } catch (IOException ignored) {
+                // Сбой одного файла не мешает сверке остальных.
+            }
+            hashes.add(new FileHash(sha1, fingerprint));
+            if (hashingProgress != null) {
+                hashingProgress.accept(i + 1, files.size());
+            }
+        }
+
+        List<OnlineCheckResult> results = new ArrayList<>();
+        // Пакетные запросы вместо двух сетевых запросов на каждый мод.
+        for (int start = 0; start < hashes.size(); start += 100) {
+            List<FileHash> batch = hashes.subList(start, Math.min(start + 100, hashes.size()));
+            Map<String, OnlineStatus> modrinth = checkModrinthBatch(batch);
+            Map<String, OnlineStatus> curseForge = checkCurseForgeBatch(batch);
+            for (FileHash hash : batch) {
+                results.add(new OnlineCheckResult(hash.sha1(),
+                        modrinth.getOrDefault(hash.sha1(), OnlineStatus.SKIPPED),
+                        curseForge.getOrDefault(hash.sha1(), OnlineStatus.SKIPPED)));
+            }
+        }
+        return results;
+    }
+
+    private Map<String, OnlineStatus> checkModrinthBatch(List<FileHash> batch) {
+        Map<String, OnlineStatus> results = new LinkedHashMap<>();
+        if (modrinthUnavailable) {
+            return results;
+        }
+        JsonArray values = new JsonArray();
+        for (FileHash hash : batch) {
+            if (hash.sha1() != null && !results.containsKey(hash.sha1())) {
+                values.add(hash.sha1());
+                results.put(hash.sha1(), OnlineStatus.SKIPPED);
+            }
+        }
+        if (values.isEmpty()) {
+            return results;
+        }
+        JsonObject body = new JsonObject();
+        body.add("hashes", values);
+        body.addProperty("algorithm", "sha1");
+        try {
+            HttpResponse<String> response = postBatch(modrinthUri, body, false);
+            if (response.statusCode() == 404) {
+                results.replaceAll((hash, status) -> OnlineStatus.NOT_FOUND);
+            } else if (response.statusCode() == 200) {
+                JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
+                Map<String, Boolean> found = new LinkedHashMap<>();
+                for (var entry : root.entrySet()) {
+                    if (!entry.getValue().isJsonObject()) {
+                        throw new IllegalArgumentException("Некорректный ответ Modrinth");
+                    }
+                    found.put(entry.getKey().toLowerCase(Locale.ROOT), true);
+                }
+                results.replaceAll((hash, status) -> found.containsKey(hash)
+                        ? OnlineStatus.CONFIRMED : OnlineStatus.NOT_FOUND);
+            }
+        } catch (IOException e) {
+            modrinthUnavailable = true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            modrinthUnavailable = true;
+        } catch (RuntimeException ignored) {
+            // Некорректный ответ не означает, что файл отсутствует на сайте.
+        }
+        return results;
+    }
+
+    private Map<String, OnlineStatus> checkCurseForgeBatch(List<FileHash> batch) {
+        Map<String, OnlineStatus> results = new LinkedHashMap<>();
+        if (curseForgeKey == null || curseForgeKey.isBlank() || curseForgeUnavailable) {
+            return results;
+        }
+        JsonArray values = new JsonArray();
+        Map<Long, List<String>> requested = new LinkedHashMap<>();
+        for (FileHash hash : batch) {
+            if (hash.sha1() != null && hash.fingerprint() != null) {
+                if (!requested.containsKey(hash.fingerprint())) {
+                    values.add(hash.fingerprint());
+                }
+                requested.computeIfAbsent(hash.fingerprint(), ignored -> new ArrayList<>())
+                        .add(hash.sha1());
+                results.put(hash.sha1(), curseForgeKeyRejected
+                        ? OnlineStatus.INVALID_KEY : OnlineStatus.SKIPPED);
+            }
+        }
+        if (values.isEmpty() || curseForgeKeyRejected) {
+            return results;
+        }
+        JsonObject body = new JsonObject();
+        body.add("fingerprints", values);
+        try {
+            HttpResponse<String> response = postBatch(curseForgeUri, body, true);
+            if (response.statusCode() == 403) {
+                curseForgeKeyRejected = true;
+                results.replaceAll((hash, status) -> OnlineStatus.INVALID_KEY);
+            } else if (response.statusCode() == 200) {
+                JsonObject data = JsonParser.parseString(response.body())
+                        .getAsJsonObject().getAsJsonObject("data");
+                JsonArray matches = data.getAsJsonArray("exactMatches");
+                Map<String, Boolean> confirmed = new LinkedHashMap<>();
+                for (JsonElement match : matches) {
+                    JsonObject file = match.getAsJsonObject().getAsJsonObject("file");
+                    if (file == null || !file.has("fileFingerprint") || !file.has("hashes")) {
+                        throw new IllegalArgumentException("Некорректный ответ CurseForge");
+                    }
+                    List<String> expected = requested.get(file.get("fileFingerprint").getAsLong());
+                    if (expected == null) {
+                        continue;
+                    }
+                    for (JsonElement item : file.getAsJsonArray("hashes")) {
+                        JsonObject hash = item.getAsJsonObject();
+                        if (hash.get("algo").getAsInt() == 1) {
+                            String sha1 = hash.get("value").getAsString().toLowerCase(Locale.ROOT);
+                            if (expected.contains(sha1)) {
+                                confirmed.put(sha1, true);
+                            }
+                        }
+                    }
+                }
+                // Отпечаток AND SHA-1: ответ для другого файла не даёт доверие.
+                results.replaceAll((hash, status) -> confirmed.containsKey(hash)
+                        ? OnlineStatus.CONFIRMED : OnlineStatus.NOT_FOUND);
+            }
+        } catch (IOException e) {
+            curseForgeUnavailable = true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            curseForgeUnavailable = true;
+        } catch (RuntimeException ignored) {
+            // При сбое разбора оставляем SKIPPED, а не NOT_FOUND.
+        }
+        return results;
+    }
+
+    private HttpResponse<String> postBatch(URI endpoint, JsonObject body, boolean curseForge)
+            throws IOException, InterruptedException {
+        HttpRequest.Builder request = HttpRequest.newBuilder(endpoint)
+                .timeout(Duration.ofSeconds(15))
+                .header("User-Agent", USER_AGENT)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json");
+        if (curseForge) {
+            request.header("x-api-key", curseForgeKey);
+        }
+        return http.send(request.POST(HttpRequest.BodyPublishers.ofString(
+                body.toString(), StandardCharsets.UTF_8)).build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
     }
 
     public OnlineCheckResult check(Path jar, ModScanResult scan) {

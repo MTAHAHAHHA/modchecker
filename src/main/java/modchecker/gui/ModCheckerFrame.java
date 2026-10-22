@@ -28,6 +28,7 @@ import javax.swing.JTextField;
 import javax.swing.JToggleButton;
 import javax.swing.ListSelectionModel;
 import javax.swing.SwingWorker;
+import javax.swing.SwingUtilities;
 import javax.swing.filechooser.FileFilter;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.table.TableCellRenderer;
@@ -54,6 +55,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutionException;
+import java.util.function.Function;
 
 /**
  * Простое Swing-окно. Вся проверка выполняется существующими
@@ -72,7 +74,10 @@ public final class ModCheckerFrame extends JFrame {
     private final JTextField pathField = new JTextField();
     private final JButton folderButton = new JButton("Папка...");
     private final JButton jarButton = new JButton("Файл .jar/.sample...");
-    private final JButton scanButton = new JButton("Проверить");
+    private final JButton scanButton = new JButton("Полная проверка");
+    private final JButton sitesButton = new JButton("Проверить на сайтах");
+    private final JButton fullSelectedButton = new JButton("Полная проверка выбранного");
+    private final JButton fullUnconfirmedButton = new JButton("Полная проверка неподтверждённых");
     private final JButton saveButton = new JButton("Сохранить отчёт");
     private final JButton trustButton = new JButton("Доверять этому файлу");
     private final JButton untrustButton = new JButton("Убрать из доверенных");
@@ -83,8 +88,11 @@ public final class ModCheckerFrame extends JFrame {
             Component component = super.prepareRenderer(renderer, row, column);
             if (!isRowSelected(row)) {
                 int modelRow = convertRowIndexToModel(row);
-                Verdict verdict = tableModel.reportAt(modelRow).scan().verdict();
-                component.setBackground(backgroundFor(verdict));
+                ModReport report = tableModel.reportAt(modelRow);
+                Verdict verdict = report.scan().verdict();
+                component.setBackground(!report.fullScan() && !report.scan().hasError()
+                        ? (report.online().confirmed() ? TRUSTED_BACKGROUND : UNKNOWN_BACKGROUND)
+                        : backgroundFor(verdict));
                 component.setForeground(Color.BLACK);
             }
             return component;
@@ -102,9 +110,15 @@ public final class ModCheckerFrame extends JFrame {
 
     private final List<ModReport> reports = new ArrayList<>();
     private volatile boolean scanning;
+    private final Function<String, OnlineChecker> checkerFactory;
 
     public ModCheckerFrame() {
+        this(OnlineChecker::new);
+    }
+
+    public ModCheckerFrame(Function<String, OnlineChecker> checkerFactory) {
         super("ModChecker 1.2");
+        this.checkerFactory = checkerFactory;
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setMinimumSize(new Dimension(900, 650));
         setSize(1100, 760);
@@ -207,7 +221,13 @@ public final class ModCheckerFrame extends JFrame {
         panel.setBorder(BorderFactory.createEmptyBorder(4, 0, 6, 0));
 
         scanButton.addActionListener(event -> startScan());
-        panel.add(scanButton, BorderLayout.WEST);
+        scanButton.setToolTipText("Анализ кода и ресурсов всех модов по указанному пути");
+        sitesButton.setToolTipText("Сверить хеши с Modrinth и CurseForge без анализа кода");
+        sitesButton.addActionListener(event -> startOnlineCheck());
+        JPanel scanActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        scanActions.add(sitesButton);
+        scanActions.add(scanButton);
+        panel.add(scanActions, BorderLayout.WEST);
 
         progressBar.setStringPainted(true);
         progressBar.setMinimum(0);
@@ -229,7 +249,7 @@ public final class ModCheckerFrame extends JFrame {
         table.setRowSorter(ModTableModel.createSorter(tableModel));
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         table.getColumnModel().getColumn(0).setPreferredWidth(220);
-        table.getColumnModel().getColumn(1).setPreferredWidth(130);
+        table.getColumnModel().getColumn(1).setPreferredWidth(220);
         table.getColumnModel().getColumn(2).setPreferredWidth(60);
         table.getColumnModel().getColumn(3).setPreferredWidth(150);
         table.getColumnModel().getColumn(4).setPreferredWidth(150);
@@ -260,9 +280,32 @@ public final class ModCheckerFrame extends JFrame {
         trustButtons.add(trustButton);
         trustButtons.add(untrustButton);
 
+        fullSelectedButton.setEnabled(false);
+        fullSelectedButton.setToolTipText("Статический анализ выбранного файла после сверки с сайтами");
+        fullSelectedButton.addActionListener(event -> {
+            ModReport report = selectedReport();
+            if (report != null && !scanning) {
+                beginScan(List.of(report.scan().file()), false, true);
+            }
+        });
+        fullUnconfirmedButton.setEnabled(false);
+        fullUnconfirmedButton.setToolTipText("Полная проверка файлов без подтверждения, включая пропущенные онлайн-проверки");
+        fullUnconfirmedButton.addActionListener(event -> {
+            List<Path> pending = reports.stream().filter(ModReport::needsFullScan)
+                    .map(report -> report.scan().file()).toList();
+            if (!pending.isEmpty() && !scanning) {
+                beginScan(pending, false, true);
+            }
+        });
+        JPanel followupButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        followupButtons.add(fullSelectedButton);
+        followupButtons.add(fullUnconfirmedButton);
+        JPanel resultActions = new JPanel(new BorderLayout());
+        resultActions.add(followupButtons, BorderLayout.WEST);
+        resultActions.add(trustButtons, BorderLayout.EAST);
         JPanel tableBottom = new JPanel(new BorderLayout());
-        tableBottom.add(hint, BorderLayout.WEST);
-        tableBottom.add(trustButtons, BorderLayout.EAST);
+        tableBottom.add(hint, BorderLayout.NORTH);
+        tableBottom.add(resultActions, BorderLayout.CENTER);
         tablePanel.add(tableBottom, BorderLayout.SOUTH);
 
         detailsArea.setEditable(false);
@@ -285,9 +328,9 @@ public final class ModCheckerFrame extends JFrame {
         JPanel panel = new JPanel(new BorderLayout(8, 0));
         panel.setBorder(BorderFactory.createEmptyBorder(4, 8, 8, 8));
         totalsLabel.setFont(totalsLabel.getFont().deriveFont(Font.BOLD));
-        panel.add(totalsLabel, BorderLayout.WEST);
+        panel.add(totalsLabel, BorderLayout.NORTH);
         statusLabel.setForeground(new Color(90, 90, 90));
-        panel.add(statusLabel, BorderLayout.EAST);
+        panel.add(statusLabel, BorderLayout.SOUTH);
         return panel;
     }
 
@@ -394,6 +437,14 @@ public final class ModCheckerFrame extends JFrame {
     }
 
     public void startScan() {
+        startPathScan(false);
+    }
+
+    public void startOnlineCheck() {
+        startPathScan(true);
+    }
+
+    private void startPathScan(boolean onlineOnly) {
         if (scanning) {
             return;
         }
@@ -434,51 +485,89 @@ public final class ModCheckerFrame extends JFrame {
             return;
         }
 
+        beginScan(mods, onlineOnly, false);
+    }
+
+    private void beginScan(List<Path> mods, boolean onlineOnly, boolean replaceExisting) {
+        if (scanning || mods.isEmpty()) return;
         String key = currentKey();
+        if (key.isEmpty()) keyStatusLabel.setText("Ключ не задан — CurseForge пропускается");
         if (!key.isEmpty() && rememberKeyCheck.isSelected()) {
             saveKey(key, false);
         }
-
-        reports.clear();
-        tableModel.setReports(List.of());
-        detailsArea.setText("");
-        updateTotals();
-        updateTrustButtons();
+        if (!replaceExisting) {
+            reports.clear();
+            tableModel.setReports(List.of());
+            detailsArea.setText("");
+        }
         scanning = true;
         scanButton.setEnabled(false);
+        sitesButton.setEnabled(false);
+        pathField.setEnabled(false);
+        folderButton.setEnabled(false);
+        jarButton.setEnabled(false);
         saveButton.setEnabled(false);
-        statusLabel.setText("Проверяю...");
+        updateTrustButtons();
+        updateTotals();
+        statusLabel.setText(onlineOnly ? "Сверяю файлы с сайтами..." : "Полная статическая проверка...");
         progressBar.setMaximum(mods.size());
         progressBar.setValue(0);
         progressBar.setString("мод 0 из " + mods.size());
+        new ScanWorker(mods, checkerFactory.apply(key), onlineOnly, replaceExisting).execute();
+    }
 
-        new ScanWorker(mods, new OnlineChecker(key)).execute();
+    private void mergeReport(ModReport report) {
+        for (int i = 0; i < reports.size(); i++) {
+            if (reports.get(i).scan().file().equals(report.scan().file())) {
+                reports.set(i, report);
+                return;
+            }
+        }
+        reports.add(report);
     }
 
     private final class ScanWorker extends SwingWorker<List<ModReport>, ModReport> {
-
         private final List<Path> mods;
         private final OnlineChecker onlineChecker;
+        private final boolean onlineOnly;
+        private final boolean replaceExisting;
+        private int completed;
 
-        private ScanWorker(List<Path> mods, OnlineChecker onlineChecker) {
+        private ScanWorker(List<Path> mods, OnlineChecker onlineChecker,
+                           boolean onlineOnly, boolean replaceExisting) {
             this.mods = mods;
             this.onlineChecker = onlineChecker;
+            this.onlineOnly = onlineOnly;
+            this.replaceExisting = replaceExisting;
         }
 
         @Override
         protected List<ModReport> doInBackground() {
+            if (onlineOnly) {
+                return ScanBatch.checkSites(mods, onlineChecker,
+                        (done, total, report) -> publish(report),
+                        (hashed, total) -> SwingUtilities.invokeLater(() -> {
+                            progressBar.setValue(hashed);
+                            progressBar.setString(hashed < total
+                                    ? "Хеши: " + hashed + " из " + total
+                                    : "Сверяю хеши с Modrinth и CurseForge...");
+                        }));
+            }
             return ScanBatch.scan(mods, onlineChecker,
-                    (completed, total, report) -> publish(report));
+                    (done, total, report) -> publish(report));
         }
 
         @Override
         protected void process(List<ModReport> chunks) {
             for (ModReport report : chunks) {
-                tableModel.addReport(report);
-                reports.add(report);
+                if (replaceExisting) {
+                    mergeReport(report);
+                } else {
+                    reports.add(report);
+                }
+                completed++;
             }
-
-            int completed = reports.size();
+            tableModel.setReports(reports);
             progressBar.setMaximum(mods.size());
             progressBar.setValue(completed);
             progressBar.setString("мод " + completed + " из " + mods.size());
@@ -487,25 +576,27 @@ public final class ModCheckerFrame extends JFrame {
 
         @Override
         protected void done() {
-            scanning = false;
-            scanButton.setEnabled(true);
             try {
                 List<ModReport> all = get();
-                tableModel.setReports(all);
-                reports.clear();
-                reports.addAll(all);
-                updateTotals();
-                updateTrustButtons();
-
+                if (!replaceExisting) reports.clear();
+                for (ModReport report : all) mergeReport(report);
+                tableModel.setReports(reports);
                 progressBar.setMaximum(Math.max(1, all.size()));
                 progressBar.setValue(all.size());
                 progressBar.setString("готово: " + all.size() + " мод(ов)");
-                saveButton.setEnabled(!all.isEmpty());
-                statusLabel.setText(onlineChecker.hadNetworkError()
-                        ? "нет сети: онлайн-проверки пропущены"
-                        : "проверка завершена");
-
-                if (table.getRowCount() > 0) {
+                if (onlineChecker.hadNetworkError()) {
+                    statusLabel.setText("Онлайн-проверка частично недоступна; подробности в таблице");
+                } else if (onlineOnly) {
+                    long pending = reports.stream().filter(ModReport::needsFullScan).count();
+                    statusLabel.setText(pending > 0
+                            ? "Без подтверждения: " + pending + ". Доступна полная проверка"
+                            : "Сверка завершена. Анализ кода не выполнялся");
+                } else {
+                    statusLabel.setText("Полная проверка завершена");
+                }
+                if (replaceExisting && !all.isEmpty()) {
+                    refreshSelection(all.get(0).scan().file());
+                } else if (table.getRowCount() > 0) {
                     table.setRowSelectionInterval(0, 0);
                 }
             } catch (InterruptedException e) {
@@ -514,12 +605,27 @@ public final class ModCheckerFrame extends JFrame {
             } catch (ExecutionException e) {
                 statusLabel.setText("ошибка");
                 progressBar.setString("ошибка");
-                saveButton.setEnabled(!reports.isEmpty());
                 showError("Ошибка проверки: " + message(e.getCause()));
+            } finally {
+                scanning = false;
+                scanButton.setEnabled(true);
+                sitesButton.setEnabled(true);
+                pathField.setEnabled(true);
+                folderButton.setEnabled(true);
+                jarButton.setEnabled(true);
+                saveButton.setEnabled(!reports.isEmpty());
+                updateTotals();
+                updateTrustButtons();
             }
         }
     }
 
+    private void updateFullButtons() {
+        ModReport selected = selectedReport();
+        fullSelectedButton.setEnabled(!scanning && selected != null && !selected.fullScan());
+        fullUnconfirmedButton.setEnabled(!scanning
+                && reports.stream().anyMatch(ModReport::needsFullScan));
+    }
     private void showDetails() {
         int viewRow = table.getSelectedRow();
         if (viewRow < 0) {
@@ -568,7 +674,7 @@ public final class ModCheckerFrame extends JFrame {
             report.scan().markManuallyTrusted(
                     file.toAbsolutePath().normalize().toString(),
                     report.scan().name());
-            refreshAfterTrustChange(report.scan().file());
+            refreshSelection(report.scan().file());
             statusLabel.setText(added
                     ? "файл добавлен в доверенные"
                     : "файл уже был в доверенных");
@@ -594,7 +700,7 @@ public final class ModCheckerFrame extends JFrame {
             int removed = TrustedHashes.removeEverywhere(
                     report.scan().file(), sha1);
             report.scan().clearManualTrust();
-            refreshAfterTrustChange(report.scan().file());
+            refreshSelection(report.scan().file());
             statusLabel.setText(removed > 0
                     ? "файл убран из доверенных"
                     : "хеш не найден в trusted_hashes.txt");
@@ -603,7 +709,7 @@ public final class ModCheckerFrame extends JFrame {
         }
     }
 
-    private void refreshAfterTrustChange(Path selectedFile) {
+    private void refreshSelection(Path selectedFile) {
         tableModel.setReports(reports);
         for (int viewRow = 0; viewRow < table.getRowCount(); viewRow++) {
             int modelRow = table.convertRowIndexToModel(viewRow);
@@ -627,8 +733,9 @@ public final class ModCheckerFrame extends JFrame {
     }
 
     private void updateTrustButtons() {
+        updateFullButtons();
         ModReport report = selectedReport();
-        if (report == null) {
+        if (scanning || report == null || !report.fullScan()) {
             trustButton.setEnabled(false);
             untrustButton.setEnabled(false);
             return;
@@ -648,8 +755,17 @@ public final class ModCheckerFrame extends JFrame {
         int trusted = 0;
         int ok = 0;
         int errors = 0;
+        int siteOnly = 0;
+        int confirmed = 0;
+        int siteErrors = 0;
 
         for (ModReport report : reports) {
+            if (!report.fullScan()) {
+                siteOnly++;
+                if (report.online().confirmed()) confirmed++;
+                if (report.scan().hasError()) siteErrors++;
+                continue;
+            }
             Verdict verdict = report.scan().verdict();
             if (verdict == Verdict.DANGEROUS) {
                 dangerous++;
@@ -666,12 +782,18 @@ public final class ModCheckerFrame extends JFrame {
             }
         }
 
-        totalsLabel.setText("ОК: " + ok
+        String fullTotals = "ОК: " + ok
                 + "   ДОВЕРЕН: " + trusted
                 + "   НЕИЗВЕСТНО: " + unknown
                 + "   ПОДОЗРИТЕЛЬНО: " + suspicious
                 + "   ОПАСНО: " + dangerous
-                + "   ОШИБКА: " + errors);
+                + "   ОШИБКА: " + errors;
+        totalsLabel.setText(siteOnly > 0
+                ? "<html>На сайтах: " + confirmed + " подтверждено / "
+                    + (siteOnly - confirmed - siteErrors) + " без подтверждения / "
+                    + siteErrors + " ошибок"
+                    + (siteOnly < reports.size() ? "<br>Полная: " + fullTotals : "") + "</html>"
+                : fullTotals);
     }
 
     private void saveReport() {
@@ -717,7 +839,7 @@ public final class ModCheckerFrame extends JFrame {
         new SwingWorker<KeyCheckStatus, Void>() {
             @Override
             protected KeyCheckStatus doInBackground() {
-                return new OnlineChecker(key).checkKey();
+                return checkerFactory.apply(key).checkKey();
             }
 
             @Override
