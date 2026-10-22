@@ -75,7 +75,7 @@ public final class ModCheckerFrame extends JFrame {
     private final JButton folderButton = new JButton("Папка...");
     private final JButton jarButton = new JButton("Файл .jar/.sample...");
     private final JButton scanButton = new JButton("Полная проверка");
-    private final JButton sitesButton = new JButton("Проверить на сайтах");
+    private final JButton sitesButton = new JButton("Быстрая проверка");
     private final JButton fullSelectedButton = new JButton("Полная проверка выбранного");
     private final JButton fullUnconfirmedButton = new JButton("Полная проверка неподтверждённых");
     private final JButton saveButton = new JButton("Сохранить отчёт");
