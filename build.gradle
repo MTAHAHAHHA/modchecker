@@ -13,6 +13,7 @@ repositories {
 dependencies {
     implementation 'org.ow2.asm:asm:9.11.1'
     implementation 'com.google.code.gson:gson:2.14.0'
+    implementation 'com.formdev:flatlaf:3.7.2'
 }
 
 java {
@@ -134,4 +135,16 @@ tasks.register('quickGuiSmoke', JavaExec) {
 }
 tasks.named('check') {
     dependsOn tasks.named('selfTest')
+}
+
+tasks.register('corpusAudit', JavaExec) {
+    group = 'verification'
+    description = 'Statically audits mixed samples as data; never executes sample code.'
+    dependsOn tasks.named('selftestClasses')
+    classpath = sourceSets.selftest.runtimeClasspath
+    mainClass = 'modchecker.selftest.CorpusAudit'
+    maxHeapSize = '2g'
+    args providers.gradleProperty('testModsDir').getOrElse('C:/virus/test_mods'),
+            layout.buildDirectory.file('corpus-audit/after.json').get().asFile.absolutePath,
+            layout.buildDirectory.file('corpus-audit/sites.json').get().asFile.absolutePath
 }

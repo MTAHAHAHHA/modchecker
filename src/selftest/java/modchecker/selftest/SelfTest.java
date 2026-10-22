@@ -1003,6 +1003,18 @@ public final class SelfTest {
                 QuickCheckSelfTest.fullScan(extraDir));
         check("Быстрая проверка: таблица и отчёт не обещают анализ кода", () ->
                 QuickCheckSelfTest.presentation());
+        for (String kind : List.of("entry", "total", "count", "class", "nested")) {
+            check("Ограничения архива: " + kind, () -> ModernizationSelfTest.limits(tempDir, kind));
+        }
+        check("Ограничения: время и прерывание дают ошибку", () -> ModernizationSelfTest.timeLimit(tempDir));
+        check("Нативные файлы: только чтение, SHA-256 и вложенные пути", () -> ModernizationSelfTest.nativeFiles(tempDir));
+        check("VirusTotal: GET и постоянный кэш", () -> ModernizationSelfTest.vtFound(tempDir));
+        check("VirusTotal: нет данных, нет ключа, истечение кэша", () -> ModernizationSelfTest.vtMissing(tempDir));
+        check("VirusTotal: ошибки ключа, квоты и ответа", () -> ModernizationSelfTest.vtErrors(tempDir));
+        check("VirusTotal: общий лимит 4/мин и 500/сутки", () -> ModernizationSelfTest.vtQuota(tempDir));
+        check("VirusTotal: вердикт и правило 17 не меняются", () -> ModernizationSelfTest.vtNoVerdict(tempDir));
+        check("Представление: фильтры и JSON не меняют находки", ModernizationSelfTest::filtersAndExport);
+        check("Murmur2: потоковый отпечаток совпадает с исходным", () -> ModernizationSelfTest.streamingHash(tempDir));
         check("Modrinth: разбор ответа и User-Agent", () -> {
             require(OnlineChecker.USER_AGENT.equals("modchecker/1.2"),
                     "неверный User-Agent для Modrinth");

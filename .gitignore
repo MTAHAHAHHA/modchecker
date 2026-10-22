@@ -11,6 +11,7 @@ curseforge_key.txt
 virustotal_key.txt
 trusted_hashes.txt
 modchecker-report*.txt
+modchecker-report*.json
 
 # IDE
 .idea/

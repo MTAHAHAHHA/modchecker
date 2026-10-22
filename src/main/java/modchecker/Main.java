@@ -2,13 +2,13 @@ package modchecker;
 
 import modchecker.app.ScanBatch;
 import modchecker.gui.ModCheckerFrame;
+import modchecker.gui.ThemeManager;
 import modchecker.online.OnlineChecker;
 import modchecker.report.ModReport;
 import modchecker.report.ReportPrinter;
 import modchecker.scan.ModFinder;
 
 import javax.swing.SwingUtilities;
-import javax.swing.UIManager;
 import java.awt.GraphicsEnvironment;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -86,7 +86,7 @@ public final class Main {
         }
 
         try {
-            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            ThemeManager.ensureInstalled();
         } catch (Exception ignored) {
             // Остаёмся на стандартном виде Swing.
         }

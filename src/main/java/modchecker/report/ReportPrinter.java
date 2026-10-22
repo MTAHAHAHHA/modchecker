@@ -80,6 +80,19 @@ public final class ReportPrinter {
         out.println("Modrinth: " + online.modrinth().label());
         out.println("CurseForge: " + online.curseForge().label());
 
+        if (!report.nativeReports().isEmpty()) {
+            out.println("VirusTotal — только SHA-256, баллы сканера не изменяются:");
+            for (NativeFileReport nativeFile : report.nativeReports()) {
+                out.println("  " + nativeFile.file().location());
+                out.println("  SHA-256: " + nativeFile.file().sha256());
+                out.println("  " + nativeFile.result().label() + (nativeFile.result().cached() ? " (кэш)" : ""));
+                if (nativeFile.result().analyzedAt() > 0) {
+                    out.println("  Дата анализа: " + java.time.Instant.ofEpochSecond(nativeFile.result().analyzedAt()));
+                }
+            }
+            out.println("Отсутствие данных или срабатываний VirusTotal не гарантирует безопасность.");
+        }
+
         if (scan.hasError()) {
             out.println(scan.verdict().label() + ": " + scan.error());
             return;
@@ -91,6 +104,13 @@ public final class ReportPrinter {
                     : "Подтверждение не получено. Выполните полную проверку; отсутствие на сайте не доказывает вредоносность.");
             return;
         }
+        if (scan.isDangerous()) {
+            out.println("Причина внимания: " + (scan.isOnlineConfirmed()
+                    ? "есть серьёзные признаки, но точный хеш подтверждён на сайте; итог не выше ПОДОЗРИТЕЛЬНО."
+                    : "есть серьёзные сочетания признаков; проверьте критическую связку и места ниже."));
+        } else if (!scan.findings().isEmpty()) {
+            out.println("Контекст: найдены возможности или строки, требующие просмотра; сами по себе они не доказывают заражение.");
+        }
         if (scan.findings().isEmpty()) {
             out.println("Находки: нет");
         } else {
@@ -101,8 +121,14 @@ public final class ReportPrinter {
                         out.println("  [" + finding.rule() + "] "
                                 + finding.title() + ": +" + finding.points());
                         out.println("      место: " + finding.location());
+                        out.println("      источник: " + (finding.location().contains("!/") ? "вложенный JAR" : "основной JAR"));
                         if (!finding.evidence().isBlank()) {
                             out.println("      " + finding.evidence());
+                        }
+                        for (var extra : scan.evidenceLocations(finding.rule())) {
+                            if (!extra.location().equals(finding.location())) {
+                                out.println("      также: " + extra.location());
+                            }
                         }
                     });
         }

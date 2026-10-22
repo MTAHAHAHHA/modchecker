@@ -25,12 +25,21 @@ public final class ScanService {
             ".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".scr"
     );
 
+    private final ScanLimits limits;
+
+    public ScanService() { this(ScanLimits.DEFAULT); }
+    public ScanService(ScanLimits limits) { this.limits = limits; }
+
     public ModScanResult scan(Path modFile) {
+        long started = System.nanoTime();
         ModScanResult result = new ModScanResult(modFile);
 
         JarContents contents;
         try {
-            contents = JarWalker.read(modFile);
+            contents = JarWalker.read(modFile, limits, started);
+        } catch (ScanLimitException e) {
+            result.markError("Проверка не завершена: " + e.getMessage());
+            return result;
         } catch (IOException e) {
             result.markError("файл битый или не мод");
             return result;
@@ -51,6 +60,10 @@ public final class ScanService {
         BytecodeScanState bytecodeState = new BytecodeScanState();
 
         for (ArchiveFile file : files) {
+            try { limits.checkTime(started); } catch (ScanLimitException e) {
+                result.markError("Проверка не завершена: " + e.getMessage());
+                return result;
+            }
             String lowerName = file.entryName().toLowerCase(Locale.ROOT);
 
             if (lowerName.endsWith(".class")) {
@@ -94,12 +107,20 @@ public final class ScanService {
             ));
         }
 
+        try { limits.checkTime(started); } catch (ScanLimitException e) {
+            result.markError("Проверка не завершена: " + e.getMessage());
+            return result;
+        }
         rat.finish();
 
         List<String> classNames = ClassNameScanner.simpleNames(files);
         hardwareIds.finish(classNames);
         ClassNameScanner.inspectNames(classNames, result);
         LinkService.apply(result);
+
+        try { limits.checkTime(started); } catch (ScanLimitException e) {
+            result.markError("Проверка не завершена: " + e.getMessage());
+        }
 
         return result;
     }

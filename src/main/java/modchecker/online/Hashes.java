@@ -63,8 +63,42 @@ public final class Hashes {
     }
 
     public static long curseForgeFingerprint(Path file) throws IOException {
-        return curseForgeFingerprint(Files.readAllBytes(file));
+        // Murmur2 включает длину в начальное состояние: два прохода без загрузки JAR в память.
+        long length = 0;
+        byte[] buffer = new byte[64 * 1024];
+        try (InputStream input = Files.newInputStream(file)) {
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                for (int i = 0; i < read; i++) if (!ignored(buffer[i] & 255)) length++;
+            }
+        }
+        if (length > Integer.MAX_VALUE) throw new IOException("Файл слишком большой для отпечатка CurseForge");
+        int h = 1 ^ (int) length;
+        int k = 0, used = 0;
+        long seen = 0;
+        try (InputStream input = Files.newInputStream(file)) {
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                for (int i = 0; i < read; i++) {
+                    int value = buffer[i] & 255;
+                    if (ignored(value)) continue;
+                    seen++;
+                    k |= value << (8 * used++);
+                    if (used == 4) {
+                        k *= MURMUR_M; k ^= k >>> MURMUR_R; k *= MURMUR_M;
+                        h *= MURMUR_M; h ^= k;
+                        k = 0; used = 0;
+                    }
+                }
+            }
+        }
+        if (seen != length) throw new IOException("Файл изменился во время вычисления отпечатка");
+        if (used > 0) { h ^= k; h *= MURMUR_M; }
+        h ^= h >>> 13; h *= MURMUR_M; h ^= h >>> 15;
+        return h & 0xFFFFFFFFL;
     }
+
+    private static boolean ignored(int value) { return value == 9 || value == 10 || value == 13 || value == 32; }
 
     public static long curseForgeFingerprint(byte[] data) {
         return murmurHash2(filterForCurseForge(data), 1);

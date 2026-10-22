@@ -3,9 +3,18 @@ package modchecker.report;
 import modchecker.model.ModScanResult;
 import modchecker.online.OnlineCheckResult;
 import modchecker.online.OnlineStatus;
+import java.util.List;
 
 /** Результат полной проверки или только сверки файла с сайтами. */
-public record ModReport(ModScanResult scan, OnlineCheckResult online, boolean fullScan) {
+public record ModReport(ModScanResult scan, OnlineCheckResult online, boolean fullScan,
+                        List<NativeFileReport> nativeReports) {
+    public ModReport { nativeReports = List.copyOf(nativeReports); }
+    public ModReport(ModScanResult scan, OnlineCheckResult online, boolean fullScan) {
+        this(scan, online, fullScan, List.of());
+    }
+    public ModReport withNativeReports(List<NativeFileReport> reports) {
+        return new ModReport(scan, online, fullScan, reports);
+    }
     public ModReport(ModScanResult scan, OnlineCheckResult online) {
         this(scan, online, true);
     }
